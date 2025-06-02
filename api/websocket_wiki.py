@@ -2,6 +2,7 @@ import logging
 import os
 from typing import List, Optional, Dict, Any
 from urllib.parse import unquote
+import asyncio
 
 import google.generativeai as genai
 from adalflow.components.model_client.ollama_client import OllamaClient
@@ -21,6 +22,75 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Define a safety margin for token limits
+# (e.g., Gemini 2.5 Pro has a 32k context window, but prompts can be large)
+# Let's aim for a prompt significantly smaller than the absolute max.
+# The previous check was at 8000, and warnings were for > 7500.
+# Let's set a more conservative overall prompt limit.
+# Considering the detailed system prompts, a 16k limit for the *entire assembled prompt*
+# before sending to the LLM might be a safer starting point.
+# The actual model context window is much larger (e.g., 32k for Gemini 2.5 Pro, or even 1M+ for others)
+# but the issue arises from the prompt itself being too large for *this specific application's typical request structure*.
+# The 7500 limit was for the user message content alone.
+# Let's refine this. The core issue is the final assembled prompt for the LLM.
+# The Google model previously errored when the *request size* (which seems to be just the last message) was 26858.
+# This suggests that the other parts of the prompt (system message, RAG context) add to this.
+# Let's set a target for the RAG context itself.
+MAX_RAG_CONTEXT_TOKENS = 10000  # Max tokens for the RAG-retrieved context_text
+MAX_OVERALL_PROMPT_TOKENS = 24000 # Revised based on observed issues with ~26k user message content.
+
+def truncate_text_by_tokens(text: str, max_tokens: int, is_ollama: bool = False) -> tuple[str, bool]:
+    """Truncates text to a maximum number of tokens. Returns (truncated_text, was_truncated)."""
+    original_tokens = count_tokens(text, is_ollama)
+    if original_tokens <= max_tokens:
+        return text, False
+
+    # Simple truncation for now, could be made smarter (e.g., sentence boundaries)
+    # For simplicity, let's try a character-based approximation for truncation.
+    avg_chars_per_token = 4  # This is a rough estimate
+    estimated_chars_to_keep = max_tokens * avg_chars_per_token
+    
+    truncated_text = text[:estimated_chars_to_keep]
+    
+    # Recalculate tokens and adjust if still over (e.g., due to UTF-8 or tokenization nuances)
+    loop_count = 0 # Safety break for loop
+    while count_tokens(truncated_text, is_ollama) > max_tokens and len(truncated_text) > 0 and loop_count < 100:
+        truncated_text = truncated_text[:-100] # Reduce by a chunk
+        if not truncated_text: # Safety break
+            break
+        loop_count += 1
+            
+    # Final check, if still over after rough truncation, do a more precise (but slower) word by word.
+    if count_tokens(truncated_text, is_ollama) > max_tokens:
+        words = text.split() # split by space, not ideal for all languages but a start
+        truncated_words = []
+        current_word_tokens = 0
+        for word in words:
+            word_with_space = word + " "
+            # Check token count of current word + space, or word itself if it's the last one or too long
+            word_tokens = count_tokens(word_with_space, is_ollama)
+            if current_word_tokens + word_tokens <= max_tokens:
+                truncated_words.append(word)
+                current_word_tokens += word_tokens
+            else:
+                # If even a single word is too long, try to truncate it (very basic)
+                if not truncated_words and count_tokens(word, is_ollama) > max_tokens:
+                    truncated_word, _ = truncate_text_by_tokens(word, max_tokens, is_ollama) # Recursive call for a single word
+                    truncated_words.append(truncated_word)
+                    current_word_tokens += count_tokens(truncated_word, is_ollama)
+                break
+        truncated_text = " ".join(truncated_words)
+
+    final_tokens = count_tokens(truncated_text, is_ollama)
+    was_actually_truncated = final_tokens < original_tokens
+    
+    if was_actually_truncated:
+        logger.warning(f"Truncated text from {original_tokens} to {final_tokens} tokens to fit token limit of {max_tokens}.")
+        return truncated_text + "... (truncated)", True
+    else:
+        # This case implies original_tokens <= max_tokens, or truncation didn't reduce it (e.g. single very long token)
+        return truncated_text, False
 
 # Get API keys from environment variables
 google_api_key = os.environ.get('GOOGLE_API_KEY')
@@ -70,14 +140,18 @@ async def handle_websocket_chat(websocket: WebSocket):
 
         # Check if request contains very large input
         input_too_large = False
+        last_message_content_tokens = 0
         if request.messages and len(request.messages) > 0:
             last_message = request.messages[-1]
             if hasattr(last_message, 'content') and last_message.content:
-                tokens = count_tokens(last_message.content, request.provider == "ollama")
-                logger.info(f"Request size: {tokens} tokens")
-                if tokens > 8000:
-                    logger.warning(f"Request exceeds recommended token limit ({tokens} > 7500)")
-                    input_too_large = True
+                # Use the provider from the request to determine if it's ollama for token counting
+                is_ollama_provider = request.provider == "ollama"
+                last_message_content_tokens = count_tokens(last_message.content, is_ollama_provider)
+                logger.info(f"Last message content size: {last_message_content_tokens} tokens")
+                # This 7500 was a general threshold. Let's keep it for the user message part.
+                if last_message_content_tokens > 7500: # Adjusted from 8000 to align with warning
+                    logger.warning(f"Last message content exceeds recommended token limit ({last_message_content_tokens} > 7500)")
+                    input_too_large = True # This flag mainly affects RAG bypass
 
         # Create a new RAG instance for this request
         try:
@@ -185,9 +259,10 @@ async def handle_websocket_chat(websocket: WebSocket):
         # Get the query from the last message
         query = last_message.content
 
-        # Only retrieve documents if input is not too large
+        # Only retrieve documents if input is not too large (based on last message content)
         context_text = ""
         retrieved_documents = None
+        retrieved_documents_count = 0
 
         if not input_too_large:
             try:
@@ -207,6 +282,7 @@ async def handle_websocket_chat(websocket: WebSocket):
                         # Format context for the prompt in a more structured way
                         documents = retrieved_documents[0].documents
                         logger.info(f"Retrieved {len(documents)} documents")
+                        retrieved_documents_count = len(documents)
 
                         # Group documents by file path
                         docs_by_file = {}
@@ -228,6 +304,10 @@ async def handle_websocket_chat(websocket: WebSocket):
 
                         # Join all parts with clear separation
                         context_text = "\n\n" + "-" * 10 + "\n\n".join(context_parts)
+                        
+                        # Proactively truncate context_text if it's too large
+                        context_text, _ = truncate_text_by_tokens(context_text, MAX_RAG_CONTEXT_TOKENS, is_ollama_provider)
+                        logger.info(f"RAG context text token count after initial truncation: {count_tokens(context_text, is_ollama_provider)}")
                     else:
                         logger.warning("No documents retrieved from RAG")
                 except Exception as e:
@@ -415,27 +495,147 @@ This file contains...
                 conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
 
         # Create the prompt with context
-        prompt = f"/no_think {system_prompt}\n\n"
+        prompt = "" # Initialize empty prompt
+        current_prompt_tokens = 0
 
+        # Determine if the query is a large instructional prompt (e.g., wiki generation template)
+        is_master_instructional_query = False
+        if last_message_content_tokens > 3000 and \
+           ("expert technical writer" in query.lower() or \
+            "[wiki_page_topic]" in query.lower() or \
+            "<details>" in query.lower() or \
+            "relevant source files" in query.lower()):
+            is_master_instructional_query = True
+            logger.info("Master instructional query detected. Using it as the primary prompt base.")
+            
+        # The /no_think prefix appears to be for Adalflow/Ollama. Add it conditionally or ensure client handles it.
+        # For now, let's assume it's handled by the client if needed based on provider.
+        # Update: It's added specifically for ollama later.
+
+        # Base prompt material
+        if is_master_instructional_query:
+            # The query (last_message.content) is the main set of instructions
+            prompt_base_text = query
+        else:
+            # For regular chat, use the backend-defined system_prompt and then the query
+            prompt_base_text = f"{system_prompt}\\n\\n<query>\\n{query}\\n</query>"
+        
+        prompt = f"{prompt_base_text}\\n\\n" # Add trailing newlines for separation
+        current_prompt_tokens = count_tokens(prompt, is_ollama_provider)
+
+        # Reserve space for "Assistant: " and a small buffer
+        RESERVED_FOR_ASSISTANT_TAG = count_tokens("Assistant: ", is_ollama_provider) + 50
+
+        # Add conversation history if it fits
         if conversation_history:
-            prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
+            conv_history_full_tag = f"<conversation_history>\\n{conversation_history}</conversation_history>\\n\\n"
+            conv_history_tokens = count_tokens(conv_history_full_tag, is_ollama_provider)
+            if current_prompt_tokens + conv_history_tokens < MAX_OVERALL_PROMPT_TOKENS - RESERVED_FOR_ASSISTANT_TAG:
+                prompt = conv_history_full_tag + prompt # Prepend history
+                current_prompt_tokens += conv_history_tokens
+            else:
+                logger.warning(f"Conversation history ({conv_history_tokens} tokens) too large for overall prompt, omitting.")
 
-        # Check if filePath is provided and fetch file content if it exists
+        # Add file content if it fits (prepend before RAG context, but after history)
+        # This order might need adjustment based on how instructions in a master_query expect file content.
+        # For now, prepending contextual items to the main query/instruction block.
+        temp_prompt_after_history = prompt
+        prompt_after_file_content = ""
+
         if file_content:
-            # Add file content to the prompt after conversation history
-            prompt += f"<currentFileContent path=\"{request.filePath}\">\n{file_content}\n</currentFileContent>\n\n"
+            file_content_full_tag = f"<currentFileContent path=\\\"{request.filePath}\\\">\\n{file_content}\\n</currentFileContent>\\n\\n"
+            file_content_tokens = count_tokens(file_content_full_tag, is_ollama_provider)
+            
+            if current_prompt_tokens + file_content_tokens < MAX_OVERALL_PROMPT_TOKENS - RESERVED_FOR_ASSISTANT_TAG:
+                prompt_after_file_content = file_content_full_tag + temp_prompt_after_history
+                current_prompt_tokens += file_content_tokens
+            else:
+                remaining_for_file = MAX_OVERALL_PROMPT_TOKENS - current_prompt_tokens - RESERVED_FOR_ASSISTANT_TAG
+                if remaining_for_file > 200: # Only add if meaningful space
+                    truncated_file_text, _ = truncate_text_by_tokens(file_content, remaining_for_file - count_tokens(f"<currentFileContent path=\\\"{request.filePath}\\\">\\n\\n</currentFileContent>\\n\\n", is_ollama_provider), is_ollama_provider)
+                    if truncated_file_text.strip():
+                        file_content_full_tag_truncated = f"<currentFileContent path=\\\"{request.filePath}\\\">\\n{truncated_file_text}\\n</currentFileContent>\\n\\n"
+                        prompt_after_file_content = file_content_full_tag_truncated + temp_prompt_after_history
+                        current_prompt_tokens += count_tokens(file_content_full_tag_truncated, is_ollama_provider)
+                        logger.warning(f"Truncated file content for {request.filePath} to fit overall prompt limit.")
+                    else:
+                        prompt_after_file_content = temp_prompt_after_history # File content was too big or truncated to empty
+                        logger.warning(f"File content for {request.filePath} too large or truncated to empty, omitting.")
+                else:
+                    prompt_after_file_content = temp_prompt_after_history
+                    logger.warning(f"File content for {request.filePath} ({file_content_tokens} tokens) too large, omitting due to insufficient remaining space.")
+            prompt = prompt_after_file_content
+        else:
+            prompt = temp_prompt_after_history
 
-        # Only include context if it's not empty
+        # Add RAG context (already truncated by MAX_RAG_CONTEXT_TOKENS) if it fits
+        # Prepend RAG context so it appears before the main query/instructions if not a master query,
+        # or before the main master_query block.
+        temp_prompt_before_rag = prompt
+        prompt_after_rag = ""
+
         CONTEXT_START = "<START_OF_CONTEXT>"
         CONTEXT_END = "<END_OF_CONTEXT>"
-        if context_text.strip():
-            prompt += f"{CONTEXT_START}\n{context_text}\n{CONTEXT_END}\n\n"
-        else:
-            # Add a note that we're skipping RAG due to size constraints or because it's the isolated API
-            logger.info("No context available from RAG")
-            prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
 
-        prompt += f"<query>\n{query}\n</query>\n\nAssistant: "
+        if context_text.strip(): 
+            context_full_tag = f"{CONTEXT_START}\\n{context_text}\\n{CONTEXT_END}\\n\\n"
+            context_tokens = count_tokens(context_full_tag, is_ollama_provider)
+
+            if current_prompt_tokens + context_tokens < MAX_OVERALL_PROMPT_TOKENS - RESERVED_FOR_ASSISTANT_TAG:
+                prompt_after_rag = context_full_tag + temp_prompt_before_rag
+                current_prompt_tokens += context_tokens
+            else:
+                remaining_for_context = MAX_OVERALL_PROMPT_TOKENS - current_prompt_tokens - RESERVED_FOR_ASSISTANT_TAG
+                if remaining_for_context > 200: 
+                    # context_text was already truncated once by MAX_RAG_CONTEXT_TOKENS.
+                    # This further truncation is for the overall limit.
+                    # We need to subtract the token size of the context tags themselves.
+                    tag_tokens = count_tokens(f"{CONTEXT_START}\\n\\n{CONTEXT_END}\\n\\n", is_ollama_provider)
+                    further_truncated_context, _ = truncate_text_by_tokens(context_text, remaining_for_context - tag_tokens, is_ollama_provider)
+                    if further_truncated_context.strip():
+                        context_full_tag_further_truncated = f"{CONTEXT_START}\\n{further_truncated_context}\\n{CONTEXT_END}\\n\\n"
+                        prompt_after_rag = context_full_tag_further_truncated + temp_prompt_before_rag
+                        current_prompt_tokens += count_tokens(context_full_tag_further_truncated, is_ollama_provider)
+                        logger.warning("Further truncated RAG context to fit overall prompt limit.")
+                    else:
+                        prompt_after_rag = temp_prompt_before_rag
+                        logger.warning("RAG context too large or truncated to empty for overall limit, omitting.")
+                        prompt_after_rag = "<note>Retrieval augmentation omitted due to overall prompt size constraints.</note>\\n\\n" + prompt_after_rag
+
+                else:
+                    prompt_after_rag = temp_prompt_before_rag
+                    logger.warning("RAG context too large for overall prompt limit (insufficient space), omitting.")
+                    prompt_after_rag = "<note>Retrieval augmentation omitted due to overall prompt size constraints.</note>\\n\\n" + prompt_after_rag
+            prompt = prompt_after_rag
+        elif not input_too_large : 
+             logger.info("No documents retrieved from RAG.")
+             prompt = "<note>Answering without retrieval augmentation (no relevant documents found or input was too large for RAG).</note>\\n\\n" + prompt
+        elif input_too_large:
+            logger.info("RAG skipped because initial user message content was too large.")
+            prompt = "<note>Answering without retrieval augmentation (initial query was too large to support RAG).</note>\\n\\n" + prompt
+        
+        # Add the /no_think prefix now if it wasn't part of the base material (e.g. master query)
+        # This needs to be handled carefully. Adalflow examples suggest it's part of the input string.
+        # If it's already in `prompt` because `query` (master prompt) contained it, fine.
+        # If not, and needed by a specific client, it should be added. The Ollama client adds it later.
+        # For Gemini, it's not standard. Let's ensure it's NOT added for Gemini here unless query had it.
+        # The existing code adds it specifically for Ollama later, which is fine.
+        # The initial f"/no_think {base_prompt_material}..." was removed.
+        # If base_prompt_material was `query` and `query` started with /no_think, it would be there.
+        # If base_prompt_material was system_prompt + query, system_prompt needs to include it or not.
+        # The original `system_prompt` variables do NOT include /no_think.
+        # The old code: `prompt = f"/no_think {system_prompt}\n\n"`
+        # Let's assume `/no_think` is an Adalflow specific convention which is handled by the Adalflow client adapter code if provider is ollama etc.
+        # So, we don't need to add it universally here.
+
+        prompt += "Assistant: " # Final mandatory part
+        
+        final_prompt_tokens = count_tokens(prompt, is_ollama_provider)
+        logger.info(f"Final assembled prompt token count: {final_prompt_tokens}")
+        if final_prompt_tokens > MAX_OVERALL_PROMPT_TOKENS:
+            logger.error(f"CRITICAL: Final prompt still exceeds MAX_OVERALL_PROMPT_TOKENS ({final_prompt_tokens} > {MAX_OVERALL_PROMPT_TOKENS}) despite truncation efforts. This may lead to API errors.")
+            # Potentially, we could send an error message back to the user here immediately if the prompt is catastrophically large.
+            # For now, we let it proceed to the LLM, which will likely error out, and the existing fallback logic might catch it.
 
         model_config = get_model_config(request.provider, request.model)["model_kwargs"]
 
@@ -514,6 +714,12 @@ This file contains...
 
         # Process the response based on the provider
         try:
+            # Introduce a delay to help manage potential RPM limits
+            # 4 seconds delay aims for ~15 RPM if calls are back-to-back.
+            # This is a server-side safeguard; frontend pacing is also crucial.
+            logger.info(f"Introducing a 4-second delay before LLM call for {request.provider}...")
+            await asyncio.sleep(4) 
+
             if request.provider == "ollama":
                 # Get the response and handle it properly using the previously created api_kwargs
                 response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
@@ -583,20 +789,51 @@ This file contains...
                 logger.warning("Token limit exceeded, retrying without context")
                 try:
                     # Create a simplified prompt without context
-                    simplified_prompt = f"/no_think {system_prompt}\n\n"
+                    simplified_prompt = ""
+                    base_simplified_prompt_tokens = 0
+                    
+                    # Use system_prompt for fallback, not the (potentially huge) original query if it was a master_instructional_query
+                    simplified_prompt_base_text = f"{system_prompt}\\n\\n<query>\\n{query}\\n</query>"
+                    simplified_prompt = f"{simplified_prompt_base_text}\\n\\n"
+                    base_simplified_prompt_tokens = count_tokens(simplified_prompt, is_ollama_provider)
+
                     if conversation_history:
-                        simplified_prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
+                        conv_history_full_tag_simplified = f"<conversation_history>\\n{conversation_history}</conversation_history>\\n\\n"
+                        conv_history_tokens_simplified = count_tokens(conv_history_full_tag_simplified, is_ollama_provider)
+                        if base_simplified_prompt_tokens + conv_history_tokens_simplified < MAX_OVERALL_PROMPT_TOKENS - RESERVED_FOR_ASSISTANT_TAG:
+                             simplified_prompt = conv_history_full_tag_simplified + simplified_prompt # Prepend
+                             base_simplified_prompt_tokens += conv_history_tokens_simplified
+                        else:
+                            logger.warning("Conversation history too large for simplified fallback, omitting.")
 
-                    # Include file content in the fallback prompt if it was retrieved
-                    if request.filePath and file_content:
-                        simplified_prompt += f"<currentFileContent path=\"{request.filePath}\">\n{file_content}\n</currentFileContent>\n\n"
+                    if request.filePath and file_content: # Use original file_content, truncate as needed
+                        file_content_full_tag_simplified = f"<currentFileContent path=\\\"{request.filePath}\\\">\\n{file_content}\\n</currentFileContent>\\n\\n"
+                        file_content_tokens_simplified = count_tokens(file_content_full_tag_simplified, is_ollama_provider)
+                        
+                        if base_simplified_prompt_tokens + file_content_tokens_simplified < MAX_OVERALL_PROMPT_TOKENS - RESERVED_FOR_ASSISTANT_TAG:
+                            simplified_prompt = file_content_full_tag_simplified + simplified_prompt # Prepend
+                            base_simplified_prompt_tokens += file_content_tokens_simplified
+                        else:
+                            remaining_for_file_simplified = MAX_OVERALL_PROMPT_TOKENS - base_simplified_prompt_tokens - RESERVED_FOR_ASSISTANT_TAG
+                            if remaining_for_file_simplified > 200:
+                                tags_size = count_tokens(f"<currentFileContent path=\\\"{request.filePath}\\\">\\n\\n</currentFileContent>\\n\\n", is_ollama_provider)
+                                truncated_file_text_simplified, _ = truncate_text_by_tokens(file_content, remaining_for_file_simplified - tags_size, is_ollama_provider)
+                                if truncated_file_text_simplified.strip():
+                                    file_content_full_tag_trunc_simplified = f"<currentFileContent path=\\\"{request.filePath}\\\">\\n{truncated_file_text_simplified}\\n</currentFileContent>\\n\\n"
+                                    simplified_prompt = file_content_full_tag_trunc_simplified + simplified_prompt # Prepend
+                                    base_simplified_prompt_tokens += count_tokens(file_content_full_tag_trunc_simplified, is_ollama_provider)
+                                    logger.info("Truncated file content for simplified fallback prompt.")
+                                else:
+                                     logger.warning("File content too large or truncated to empty for simplified fallback, omitting.")
+                            else:
+                                logger.warning("File content too large for simplified fallback (insufficient space), omitting.")
 
-                    simplified_prompt += "<note>Answering without retrieval augmentation due to input size constraints.</note>\n\n"
-                    simplified_prompt += f"<query>\n{query}\n</query>\n\nAssistant: "
+                    simplified_prompt += "<note>Answering without retrieval augmentation due to input size constraints.</note>\\n\\n"
+                    simplified_prompt += "Assistant: " # Final part for simplified prompt
+                    
+                    logger.info(f"Fallback simplified prompt token count: {count_tokens(simplified_prompt, is_ollama_provider)}")
 
                     if request.provider == "ollama":
-                        simplified_prompt += " /no_think"
-
                         # Create new api_kwargs with the simplified prompt
                         fallback_api_kwargs = model.convert_inputs_to_api_kwargs(
                             input=simplified_prompt,

@@ -9,9 +9,13 @@ const SERVER_BASE_URL = process.env.NEXT_PUBLIC_SERVER_BASE_URL || 'http://local
 // Convert HTTP URL to WebSocket URL
 const getWebSocketUrl = () => {
   const baseUrl = SERVER_BASE_URL;
+  console.log('[websocketClient] SERVER_BASE_URL:', SERVER_BASE_URL);
   // Replace http:// with ws:// or https:// with wss://
-  const wsBaseUrl = baseUrl.replace(/^http/, 'ws');
-  return `${wsBaseUrl}/ws/chat`;
+  const wsBaseUrl = (process.env.NEXT_PUBLIC_SERVER_BASE_URL || baseUrl).replace(/^https/, 'wss').replace(/^http/, 'ws');
+  console.log('[websocketClient] wsBaseUrl after replace:', wsBaseUrl);
+  const finalUrl = `${wsBaseUrl}/ws/chat`;
+  console.log('[websocketClient] Final WebSocket URL for connection:', finalUrl);
+  return finalUrl;
 };
 
 export interface ChatMessage {

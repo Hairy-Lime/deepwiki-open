@@ -706,7 +706,7 @@ class DatabaseManager:
         logger.info(f"Preparing repo storage for {repo_url_or_path}...")
 
         try:
-            root_path = get_adalflow_default_root_path()
+            root_path = os.getenv("ADALFLOW_ROOT_PATH")
 
             os.makedirs(root_path, exist_ok=True)
             # url

@@ -74,7 +74,7 @@ class ChatCompletionRequest(BaseModel):
     included_dirs: Optional[str] = Field(None, description="Comma-separated list of directories to include exclusively")
     included_files: Optional[str] = Field(None, description="Comma-separated list of file patterns to include exclusively")
 
-@app.post("/chat/completions/stream")
+@app.post("/api/chat/completions/stream")
 async def chat_completions_stream(request: ChatCompletionRequest):
     """Stream a chat completion response directly using Google Generative AI"""
     try:

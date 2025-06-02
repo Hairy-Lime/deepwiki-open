@@ -174,6 +174,10 @@ export default function RepoWikiPage() {
   const owner = params.owner as string;
   const repo = params.repo as string;
 
+  // ADD THIS LOGGING:
+  console.log('[Page Params] Current window.location.href:', window.location.href);
+  console.log('[Page Params] params.owner:', owner, 'params.repo:', repo);
+
   // Extract tokens from search params
   const token = searchParams.get('token') || '';
   const repoType = searchParams.get('type') || 'github';
@@ -407,8 +411,7 @@ Remember:
 
         try {
           // Create WebSocket URL from the server base URL
-          const serverBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL || 'http://localhost:8001';
-          const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws');
+          const wsBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.replace(/^https/, 'wss').replace(/^http/, 'ws');
           const wsUrl = `${wsBaseUrl}/ws/chat`;
 
           // Create a new WebSocket connection
@@ -698,8 +701,7 @@ IMPORTANT:
 
       try {
         // Create WebSocket URL from the server base URL
-        const serverBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL || 'http://localhost:8001';
-        const wsBaseUrl = serverBaseUrl.replace(/^http/, 'ws');
+        const wsBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.replace(/^https/, 'wss').replace(/^http/, 'ws');
         const wsUrl = `${wsBaseUrl}/ws/chat`;
 
         // Create a new WebSocket connection
@@ -1617,6 +1619,15 @@ IMPORTANT:
   // Save wiki to server-side cache when generation is complete
   useEffect(() => {
     const saveCache = async () => {
+      console.log('Cache save useEffect triggered:', {
+        isLoading,
+        error: !!error,
+        hasWikiStructure: !!wikiStructure,
+        generatedPagesCount: Object.keys(generatedPages).length,
+        expectedPagesCount: wikiStructure?.pages.length || 0,
+        cacheWasLoaded: cacheLoadedSuccessfully.current
+      });
+
       if (!isLoading &&
           !error &&
           wikiStructure &&
@@ -1626,6 +1637,14 @@ IMPORTANT:
 
         const allPagesHaveContent = wikiStructure.pages.every(page =>
           generatedPages[page.id] && generatedPages[page.id].content && generatedPages[page.id].content !== 'Loading...');
+
+        console.log('Cache save conditions met, checking page content:', {
+          allPagesHaveContent,
+          pagesWithContent: wikiStructure.pages.filter(page => 
+            generatedPages[page.id] && generatedPages[page.id].content && generatedPages[page.id].content !== 'Loading...'
+          ).length,
+          totalPages: wikiStructure.pages.length
+        });
 
         if (allPagesHaveContent) {
           console.log('Attempting to save wiki data to server cache via Next.js proxy');
@@ -1647,6 +1666,9 @@ IMPORTANT:
               wiki_structure: structureToCache,
               generated_pages: generatedPages
             };
+            
+            console.log('Sending cache save request with data size:', JSON.stringify(dataToCache).length, 'bytes');
+            
             const response = await fetch(`/api/wiki_cache`, {
               method: 'POST',
               headers: {
@@ -1658,12 +1680,17 @@ IMPORTANT:
             if (response.ok) {
               console.log('Wiki data successfully saved to server cache');
             } else {
-              console.error('Error saving wiki data to server cache:', response.status, await response.text());
+              const errorText = await response.text();
+              console.error('Error saving wiki data to server cache:', response.status, errorText);
             }
           } catch (error) {
             console.error('Error saving to server cache:', error);
           }
+        } else {
+          console.log('Not all pages have content, skipping cache save');
         }
+      } else {
+        console.log('Cache save conditions not met');
       }
     };
 

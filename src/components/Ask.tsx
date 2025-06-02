@@ -312,6 +312,7 @@ const Ask: React.FC<AskProps> = ({
       let fullResponse = '';
 
       // Create a new WebSocket connection
+      console.log('Ask.tsx: requestBody for WebSocket:', JSON.stringify(requestBody)); // Log the requestBody
       webSocketRef.current = createChatWebSocket(
         requestBody,
         // Message handler
@@ -508,6 +509,14 @@ const Ask: React.FC<AskProps> = ({
   }, [response, isLoading, deepResearch, researchIteration]);
 
   const handleSubmit = async (e: React.FormEvent) => {
+    // ADD THIS SAFEGUARD
+    if (!repoInfo || !repoInfo.owner || !repoInfo.repo || repoInfo.repo === "undefined") {
+      console.error('Ask handleSubmit: Aborting due to invalid repoInfo. repoInfo.owner:', repoInfo?.owner, 'repoInfo.repo:', repoInfo?.repo);
+      setResponse('Error: Cannot submit request. Repository information is missing or invalid.');
+      setIsLoading(false);
+      return;
+    }
+
     e.preventDefault();
 
     if (!question.trim() || isLoading) return;

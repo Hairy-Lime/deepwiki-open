@@ -12,7 +12,7 @@ interface ApiProcessedProject {
 }
 
 // Ensure this matches your Python backend configuration
-const PYTHON_BACKEND_URL = process.env.PYTHON_BACKEND_HOST || 'http://localhost:8001';
+const PYTHON_BACKEND_URL = process.env.REACT_APP_PYTHON_BACKEND_HOST || 'http://localhost:8001';
 const PROJECTS_API_ENDPOINT = `${PYTHON_BACKEND_URL}/api/processed_projects`;
 
 export async function GET() {

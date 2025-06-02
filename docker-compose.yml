@@ -5,25 +5,47 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "${PORT:-8001}:${PORT:-8001}"  # API port
-      - "3000:3000"  # Next.js port
+      args:
+        NEXT_PUBLIC_SERVER_BASE_URL: https://${HOST}/api
     env_file:
       - .env
     environment:
       - PORT=${PORT:-8001}
       - NODE_ENV=production
-      - SERVER_BASE_URL=http://localhost:${PORT:-8001}
-      - NEXT_PUBLIC_SERVER_BASE_URL=http://localhost:${PORT:-8001}
+      - SERVER_BASE_URL=https://${HOST}/api
+      - NEXT_PUBLIC_SERVER_BASE_URL=https://${HOST}/api
     volumes:
-      - ~/.adalflow:/root/.adalflow  # Persist repository and embedding data
-    # Resource limits for docker-compose up (not Swarm mode)
+      - /home/hairylime/deepwiki:/app/persist
     mem_limit: 6g
-    mem_reservation: 2g
-    # Health check configuration
+    mem_reservation: 4g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8001}/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.ipallowlist.ipallowlist.sourcerange=${IP_WHITELIST}"
+      # Main frontend route (port 3000)
+      - "traefik.http.routers.deepwiki-app.rule=Host(`${HOST}`) && !PathPrefix(`/api`)"
+      - "traefik.http.routers.deepwiki-app.entrypoints=websecure"
+      - "traefik.http.routers.deepwiki-app.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.deepwiki-app.middlewares=authentik@file, ipallowlist"
+      - "traefik.http.routers.deepwiki-app.service=deepwiki-app"
+      - "traefik.http.services.deepwiki-app.loadbalancer.server.port=3000"
+      
+      # API backend route (port 8001)
+      - "traefik.http.routers.deepwiki-api.rule=Host(`${HOST}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.deepwiki-api.entrypoints=websecure"
+      - "traefik.http.routers.deepwiki-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.deepwiki-api.middlewares=ipallowlist"
+      - "traefik.http.routers.deepwiki-api.service=deepwiki-api"
+      - "traefik.http.services.deepwiki-api.loadbalancer.server.port=8001"
+      - "traefik.http.services.deepwiki-api.loadbalancer.passhostheader=true"
+
+    networks:
+      - dokploy-network
+networks:
+    dokploy-network:
+        external: true

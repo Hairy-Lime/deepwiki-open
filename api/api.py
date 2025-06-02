@@ -9,6 +9,12 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 import asyncio
+import adalflow.utils.global_config
+
+def custom_root_path():
+    return os.environ.get('ADALFLOW_ROOT_PATH')
+
+adalflow.utils.global_config.get_adalflow_default_root_path = custom_root_path
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
@@ -39,7 +45,8 @@ app.add_middleware(
 
 # Helper function to get adalflow root path
 def get_adalflow_default_root_path():
-    return os.path.expanduser(os.path.join("~", ".adalflow"))
+    #return os.path.expanduser(os.path.join("~", ".adalflow"))
+    return os.environ.get('ADALFLOW_ROOT_PATH')
 
 # --- Pydantic Models ---
 class WikiPage(BaseModel):
@@ -86,6 +93,7 @@ class WikiCacheRequest(BaseModel):
     repo: str
     repo_type: str
     language: str
+    comprehensive: Optional[bool] = True  # Add the comprehensive field that frontend sends
     wiki_structure: WikiStructureModel
     generated_pages: Dict[str, WikiPage]
 
@@ -123,7 +131,7 @@ class ModelConfig(BaseModel):
 
 from api.config import configs
 
-@app.get("/models/config", response_model=ModelConfig)
+@app.get("/api/models/config", response_model=ModelConfig)
 async def get_model_config():
     """
     Get available model providers and their models.
@@ -183,7 +191,7 @@ async def get_model_config():
             defaultProvider="google"
         )
 
-@app.post("/export/wiki")
+@app.post("/api/export/wiki")
 async def export_wiki(request: WikiExportRequest):
     """
     Export wiki content as Markdown or JSON.
@@ -231,7 +239,7 @@ async def export_wiki(request: WikiExportRequest):
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
 
-@app.get("/local_repo/structure")
+@app.get("/api/local_repo/structure")
 async def get_local_repo_structure(path: str = Query(None, description="Path to local repository")):
     """Return the file tree and README content for a local repository."""
     if not path:
@@ -304,8 +312,6 @@ def generate_markdown_export(repo_url: str, pages: List[WikiPage]) -> str:
         markdown += f"<a id='{page.id}'></a>\n\n"
         markdown += f"## {page.title}\n\n"
 
-
-
         # Add related pages
         if page.relatedPages and len(page.relatedPages) > 0:
             markdown += "### Related Pages\n\n"
@@ -350,28 +356,29 @@ def generate_json_export(repo_url: str, pages: List[WikiPage]) -> str:
     return json.dumps(export_data, indent=2)
 
 # Import the simplified chat implementation
-from api.simple_chat import chat_completions_stream
+from api.simple_chat import chat_completions_stream, ChatCompletionRequest
 from api.websocket_wiki import handle_websocket_chat
 
 # Add the chat_completions_stream endpoint to the main app
-app.add_api_route("/chat/completions/stream", chat_completions_stream, methods=["POST"])
+app.add_api_route("/api/chat/completions/stream", chat_completions_stream, methods=["POST"])
 
 # Add the WebSocket endpoint
-app.add_websocket_route("/ws/chat", handle_websocket_chat)
+app.add_websocket_route("/api/ws/chat", handle_websocket_chat)
 
 # --- Wiki Cache Helper Functions ---
 
 WIKI_CACHE_DIR = os.path.join(get_adalflow_default_root_path(), "wikicache")
 os.makedirs(WIKI_CACHE_DIR, exist_ok=True)
 
-def get_wiki_cache_path(owner: str, repo: str, repo_type: str, language: str) -> str:
+def get_wiki_cache_path(owner: str, repo: str, repo_type: str, language: str, comprehensive: bool = True) -> str:
     """Generates the file path for a given wiki cache."""
-    filename = f"deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json"
+    comp_suffix = "comprehensive" if comprehensive else "concise"
+    filename = f"deepwiki_cache_{repo_type}_{owner}_{repo}_{language}_{comp_suffix}.json"
     return os.path.join(WIKI_CACHE_DIR, filename)
 
-async def read_wiki_cache(owner: str, repo: str, repo_type: str, language: str) -> Optional[WikiCacheData]:
+async def read_wiki_cache(owner: str, repo: str, repo_type: str, language: str, comprehensive: bool = True) -> Optional[WikiCacheData]:
     """Reads wiki cache data from the file system."""
-    cache_path = get_wiki_cache_path(owner, repo, repo_type, language)
+    cache_path = get_wiki_cache_path(owner, repo, repo_type, language, comprehensive)
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'r', encoding='utf-8') as f:
@@ -384,7 +391,7 @@ async def read_wiki_cache(owner: str, repo: str, repo_type: str, language: str) 
 
 async def save_wiki_cache(data: WikiCacheRequest) -> bool:
     """Saves wiki cache data to the file system."""
-    cache_path = get_wiki_cache_path(data.owner, data.repo, data.repo_type, data.language)
+    cache_path = get_wiki_cache_path(data.owner, data.repo, data.repo_type, data.language, data.comprehensive)
     logger.info(f"Attempting to save wiki cache. Path: {cache_path}")
     try:
         payload = WikiCacheData(
@@ -398,7 +405,6 @@ async def save_wiki_cache(data: WikiCacheRequest) -> bool:
             logger.info(f"Payload prepared for caching. Size: {payload_size} bytes.")
         except Exception as ser_e:
             logger.warning(f"Could not serialize payload for size logging: {ser_e}")
-
 
         logger.info(f"Writing cache file to: {cache_path}")
         with open(cache_path, 'w', encoding='utf-8') as f:
@@ -419,19 +425,20 @@ async def get_cached_wiki(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g., github, gitlab)"),
-    language: str = Query(..., description="Language of the wiki content")
+    language: str = Query(..., description="Language of the wiki content"),
+    comprehensive: bool = Query(True, description="Whether this is a comprehensive or concise wiki")
 ):
     """
     Retrieves cached wiki data (structure and generated pages) for a repository.
     """
-    logger.info(f"Attempting to retrieve wiki cache for {owner}/{repo} ({repo_type}), lang: {language}")
-    cached_data = await read_wiki_cache(owner, repo, repo_type, language)
+    logger.info(f"Attempting to retrieve wiki cache for {owner}/{repo} ({repo_type}), lang: {language}, comprehensive: {comprehensive}")
+    cached_data = await read_wiki_cache(owner, repo, repo_type, language, comprehensive)
     if cached_data:
         return cached_data
     else:
         # Return 200 with null body if not found, as frontend expects this behavior
         # Or, raise HTTPException(status_code=404, detail="Wiki cache not found") if preferred
-        logger.info(f"Wiki cache not found for {owner}/{repo} ({repo_type}), lang: {language}")
+        logger.info(f"Wiki cache not found for {owner}/{repo} ({repo_type}), lang: {language}, comprehensive: {comprehensive}")
         return None
 
 @app.post("/api/wiki_cache")
@@ -439,7 +446,7 @@ async def store_wiki_cache(request_data: WikiCacheRequest):
     """
     Stores generated wiki data (structure and pages) to the server-side cache.
     """
-    logger.info(f"Attempting to save wiki cache for {request_data.owner}/{request_data.repo} ({request_data.repo_type}), lang: {request_data.language}")
+    logger.info(f"Attempting to save wiki cache for {request_data.owner}/{request_data.repo} ({request_data.repo_type}), lang: {request_data.language}, comprehensive: {request_data.comprehensive}")
     success = await save_wiki_cache(request_data)
     if success:
         return {"message": "Wiki cache saved successfully"}
@@ -451,13 +458,14 @@ async def delete_wiki_cache(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g., github, gitlab)"),
-    language: str = Query(..., description="Language of the wiki content")
+    language: str = Query(..., description="Language of the wiki content"),
+    comprehensive: bool = Query(True, description="Whether this is a comprehensive or concise wiki")
 ):
     """
     Deletes a specific wiki cache from the file system.
     """
-    logger.info(f"Attempting to delete wiki cache for {owner}/{repo} ({repo_type}), lang: {language}")
-    cache_path = get_wiki_cache_path(owner, repo, repo_type, language)
+    logger.info(f"Attempting to delete wiki cache for {owner}/{repo} ({repo_type}), lang: {language}, comprehensive: {comprehensive}")
+    cache_path = get_wiki_cache_path(owner, repo, repo_type, language, comprehensive)
 
     if os.path.exists(cache_path):
         try:
@@ -479,6 +487,10 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "service": "deepwiki-api"
     }
+
+@app.post("/api/chat/stream")
+async def compat_stream(request: ChatCompletionRequest):
+    return await chat_completions_stream(request)
 
 @app.get("/")
 async def root():
@@ -530,10 +542,29 @@ async def get_processed_projects():
                     stats = await asyncio.to_thread(os.stat, file_path) # Use asyncio.to_thread for os.stat
                     parts = filename.replace("deepwiki_cache_", "").replace(".json", "").split('_')
 
-                    # Expecting repo_type_owner_repo_language
-                    # Example: deepwiki_cache_github_AsyncFuncAI_deepwiki-open_en.json
-                    # parts = [github, AsyncFuncAI, deepwiki-open, en]
-                    if len(parts) >= 4:
+                    # Expecting repo_type_owner_repo_language_comprehensive
+                    # Example: deepwiki_cache_github_AsyncFuncAI_deepwiki-open_en_comprehensive.json
+                    # parts = [github, AsyncFuncAI, deepwiki-open, en, comprehensive]
+                    if len(parts) >= 5:
+                        repo_type = parts[0]
+                        owner = parts[1]
+                        language = parts[-2] # language is the second to last part
+                        comprehensive = parts[-1] # comprehensive flag is the last part
+                        repo = "_".join(parts[2:-2]) # repo can contain underscores
+
+                        project_entries.append(
+                            ProcessedProjectEntry(
+                                id=filename,
+                                owner=owner,
+                                repo=repo,
+                                name=f"{owner}/{repo}",
+                                repo_type=repo_type,
+                                submittedAt=int(stats.st_mtime * 1000), # Convert to milliseconds
+                                language=language
+                            )
+                        )
+                    # Also handle old format without comprehensive suffix for backward compatibility
+                    elif len(parts) >= 4:
                         repo_type = parts[0]
                         owner = parts[1]
                         language = parts[-1] # language is the last part
@@ -564,3 +595,7 @@ async def get_processed_projects():
     except Exception as e:
         logger.error(f"Error listing processed projects from {WIKI_CACHE_DIR}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list processed projects from server cache.")
+        
+@app.get("/api/wiki/projects")
+async def alias_to_processed_projects():
+    return await get_processed_projects()

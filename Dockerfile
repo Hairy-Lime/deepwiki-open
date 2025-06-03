@@ -26,8 +26,11 @@ FROM python:3.11-slim AS py_deps
 WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+# Add a build argument to bust cache for pip install
+ARG CACHE_BUSTER=none
 COPY api/requirements.txt ./api/
-RUN pip install --no-cache -r api/requirements.txt
+# Echo the cache buster to ensure this line changes if the arg changes, or if the Dockerfile line itself changes
+RUN echo "Cache buster: ${CACHE_BUSTER}" && pip install --no-cache -r api/requirements.txt
 
 # Use Python 3.11 as final image
 FROM python:3.11-slim

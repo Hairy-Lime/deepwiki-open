@@ -10,6 +10,7 @@ import google.generativeai as genai
 from adalflow.components.model_client.ollama_client import OllamaClient
 from adalflow.core.types import ModelType
 from fastapi import WebSocket, WebSocketDisconnect, HTTPException
+from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field
 
 from api.config import get_model_config
@@ -841,22 +842,32 @@ This file contains...
             await websocket.close() # Ensure close on error
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.info("WebSocket disconnected by client")
     except Exception as e:
         logger.error(f"Error in WebSocket handler: {str(e)}", exc_info=True)
         try:
             # Check if websocket is still open before sending
-            if websocket.client_state == websocket.client_state.CONNECTED:
+            if websocket.application_state == WebSocketState.CONNECTED:
                 await websocket.send_text(f"Error: {str(e)}")
-                await websocket.close()
+                await websocket.close(code=1011) # Internal error
         except Exception as e_close: # If sending error itself fails
-            logger.error(f"Failed to send error to client or close WebSocket: {str(e_close)}")
-            pass # WebSocket might already be closed
+            logger.error(f"Failed to send error to client or close WebSocket during exception handling: {str(e_close)}")
     finally:
         if job_acquired:
             WEBSOCKET_JOB_SEMAPHORE.release()
             logger.debug("WebSocket job semaphore released.")
-        # Ensure websocket is closed if not already, unless it was a normal disconnect
-        if websocket.client_state == websocket.client_state.CONNECTED:
-             logger.info("Ensuring WebSocket is closed in main finally block.")
-             await websocket.close()
+        
+        # Ensure websocket is closed from the server side if it hasn't been already.
+        # WebSocketState.DISCONNECTED can mean either client or server initiated the close and it's fully processed.
+        # We should only attempt to close if the server-side application_state thinks it's still connected.
+        if websocket.application_state == WebSocketState.CONNECTED:
+             try:
+                 logger.info(f"Ensuring WebSocket is closed in main finally block. Client state: {websocket.client_state}, App state: {websocket.application_state}")
+                 await websocket.close(code=1000) # Normal closure from server
+             except RuntimeError as e_runtime_close:
+                 # This might happen if a close was initiated by client concurrently or other race conditions.
+                 logger.warning(f"RuntimeError while trying to close WebSocket in finally: {e_runtime_close}. WebSocket state: {websocket.client_state}, App state: {websocket.application_state}")
+             except Exception as e_final_close:
+                 logger.error(f"Unexpected error closing WebSocket in finally: {e_final_close}")
+        else:
+            logger.debug(f"WebSocket already closed or disconnect initiated. App state: {websocket.application_state}, Client state: {websocket.client_state}")

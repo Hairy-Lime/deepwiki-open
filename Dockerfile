@@ -35,10 +35,9 @@ RUN echo "Cache buster: ${CACHE_BUSTER}" && pip install --no-cache -r api/requir
 # Use Python 3.11 as final image
 FROM python:3.11-slim
 
-# Add a build argument to bust cache for application code copy
 ARG APP_CODE_CACHE_BUSTER=none
+ARG TIMESTAMP_CACHE_BUSTER # This will be set by the build command, e.g., to current time
 
-# Set working directory
 WORKDIR /app
 
 # Install Node.js and npm
@@ -59,10 +58,14 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy Python dependencies
 COPY --from=py_deps /opt/venv /opt/venv
 
-# Echo the app code cache buster ARGS to attempt to invalidate this layer if the ARG changes
-# The simple presence of this RUN command using the ARG might also help.
 RUN echo "App code cache buster: ${APP_CODE_CACHE_BUSTER}"
+# Add a dummy file using a changing ARG to try and bust the cache for subsequent COPY commands.
+# This ADD command will be different if TIMESTAMP_CACHE_BUSTER changes.
+ADD https://www.google.com/images/errors/robot.png?nonce=${TIMESTAMP_CACHE_BUSTER} /tmp/dummy_cache_buster.png
+RUN rm /tmp/dummy_cache_buster.png # Clean up the dummy file
+
 COPY api/ ./api/
+# COPY src ./src/ # Temporarily commented out due to persistent linter/build issue unrelated to main error
 
 # Copy Node app
 COPY --from=node_builder /app/public ./public

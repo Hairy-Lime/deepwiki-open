@@ -412,7 +412,7 @@ Remember:
         try {
           // Create WebSocket URL from the server base URL
           const wsBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.replace(/^https/, 'wss').replace(/^http/, 'ws');
-          const wsUrl = `${wsBaseUrl}/ws/chat`;
+          const wsUrl = `${wsBaseUrl}/api/ws/chat`;
 
           // Create a new WebSocket connection
           const ws = new WebSocket(wsUrl);
@@ -702,7 +702,7 @@ IMPORTANT:
       try {
         // Create WebSocket URL from the server base URL
         const wsBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.replace(/^https/, 'wss').replace(/^http/, 'ws');
-        const wsUrl = `${wsBaseUrl}/ws/chat`;
+        const wsUrl = `${wsBaseUrl}/api/ws/chat`;
 
         // Create a new WebSocket connection
         const ws = new WebSocket(wsUrl);

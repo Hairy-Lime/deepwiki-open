@@ -7,7 +7,7 @@ import time # Added for rate limiter
 from collections import deque # Added for rate limiter
 
 import google.generativeai as genai
-from google.generativeai.types import GenerateContentResponse, Candidate, BlockedPromptException, generation_types
+from google.generativeai.types import BlockedPromptException, generation_types
 from adalflow.components.model_client.ollama_client import OllamaClient
 from adalflow.core.types import ModelType
 from fastapi import WebSocket, WebSocketDisconnect, HTTPException, WebSocketState
@@ -519,18 +519,48 @@ IMPORTANT:You MUST respond in {language_name} language.
                 async for chunk in response_stream:
                     stream_had_content = True; chunk_text = ""
                     try:
-                        candidate: Optional[Candidate] = chunk.candidates[0] if chunk.candidates else None
-                        if candidate and candidate.finish_reason != Candidate.FinishReason.UNSPECIFIED:
-                            if candidate.finish_reason == Candidate.FinishReason.MAX_TOKENS: yield "\n[Warning: Response truncated by AI (MAX_TOKENS).]"; break
-                            elif candidate.finish_reason != Candidate.FinishReason.STOP: yield f"\n[Error: AI stopped - {candidate.finish_reason.name}]"; break
-                        if chunk.parts: chunk_text = ''.join(getattr(p, 'text', '') for p in chunk.parts)
-                        elif hasattr(chunk, 'text'): chunk_text = chunk.text
-                        if chunk_text: yield chunk_text; full_response_text += chunk_text
-                    except BlockedPromptException as bpe: yield f"\n[Error: Google blocked prompt: {bpe}]"; break
-                    except ValueError as ve: yield "\n[Error: Google API malformed chunk.]"; logger.error(f'Google chunk error: {ve}', exc_info=True); break
-                    except Exception as e_gc: yield "\n[Error: Google stream processing error.]"; logger.error(f'Google stream error: {e_gc}', exc_info=True); break
-                if not stream_had_content and hasattr(response_stream, 'prompt_feedback') and response_stream.prompt_feedback and response_stream.prompt_feedback.block_reason:
-                    yield f"\n[Error: Google API blocked prompt before streaming. Reason: {response_stream.prompt_feedback.block_reason.name}]"
+                        candidate_obj = chunk.candidates[0] if chunk.candidates else None 
+                        if candidate_obj and candidate_obj.finish_reason != generation_types.Candidate.FinishReason.UNSPECIFIED:
+                            if candidate_obj.finish_reason == generation_types.Candidate.FinishReason.MAX_TOKENS:
+                                logger.warning("Google API response stream truncated: MAX_TOKENS.")
+                                yield "\n[Warning: Response truncated by AI model due to length limits.]"; 
+                                break 
+                            elif candidate_obj.finish_reason != generation_types.Candidate.FinishReason.STOP:
+                                safety_ratings_str = str(candidate_obj.safety_ratings) if hasattr(candidate_obj, 'safety_ratings') else 'N/A'
+                                logger.error(f"Google API stream stopped. Reason: {candidate_obj.finish_reason.name}. Details: {safety_ratings_str}")
+                                yield f"\n[Error: AI model stopped generation - {candidate_obj.finish_reason.name}]"; 
+                                stream_ended_by_error = True; break
+                        
+                        if chunk.parts:
+                            for part in chunk.parts: chunk_text += getattr(part, 'text', '')
+                        elif hasattr(chunk, 'text'): 
+                            chunk_text = chunk.text
+                        
+                        if chunk_text: 
+                            yield chunk_text
+                            full_response_text += chunk_text
+
+                    except BlockedPromptException as bpe:
+                        logger.error(f"Google API blocked prompt during streaming: {bpe}", exc_info=True)
+                        yield f"\n[Error: AI request blocked by Google's content safety filter. {bpe}]"; 
+                        stream_ended_by_error = True; break
+                    except ValueError as ve: 
+                        logger.error(f"ValueError processing Google API chunk: {ve}. Chunk: {getattr(chunk, '__dict__', str(chunk))}. Prompt tokens: {final_calculated_tokens}", exc_info=True)
+                        if hasattr(chunk, 'prompt_feedback') and chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                            block_reason = chunk.prompt_feedback.block_reason.name
+                            block_message = chunk.prompt_feedback.block_reason_message or ""
+                            logger.error(f"Google API blocked prompt (from chunk feedback). Reason: {block_reason}, Message: {block_message}")
+                            yield f"\n[Error: AI request possibly blocked by content safety filter ({block_reason}). {block_message}]"; 
+                        else:
+                            yield "\n[Error: Incomplete or malformed response from AI. The request might have been too long or hit a content filter.]"; 
+                        stream_ended_by_error = True; break
+                    except Exception as e_gc: 
+                        logger.error(f"Unexpected error processing Google API chunk: {e_gc}", exc_info=True)
+                        yield "\n[Error: Server error while processing AI response stream.]"; 
+                        stream_ended_by_error = True; break
+                
+                if not stream_had_content and not stream_ended_by_error: # Check after loop if stream didn't error but had no content
+                    logger.warning("Google stream yielded no content and did not error during iteration. Checking for upfront block if possible (though direct exception is more likely).")
 
             elif provider in ["ollama", "openrouter", "openai"]:
                 response_stream = await llm_client.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)

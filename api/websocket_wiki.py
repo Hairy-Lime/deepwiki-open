@@ -538,6 +538,26 @@ This file contains...
 - Your response language should be in the same language as the user's query
 </guidelines>
 
+<mermaid_diagram_rules>
+- EXTENSIVELY use Mermaid diagrams (e.g., `flowchart TD`, `sequenceDiagram`, `classDiagram`, `erDiagram`, `graph TD`) to visually represent architectures, flows, relationships, and schemas found in the source files.
+- Ensure diagrams are accurate and directly derived from information in the `[RELEVANT_SOURCE_FILES]`.
+- Provide a brief explanation before or after each diagram to give context.
+- CRITICAL: All diagrams MUST follow strict vertical orientation:
+    - For flow-like diagrams, the first line of the diagram block MUST BE EXACTLY `graph TD` or `flowchart TD`. NO OTHER TEXT OR DIRECTIVES (like `direction TD`) should be on this first line or inserted elsewhere to specify direction. Node and edge definitions must follow on subsequent lines.
+    - NEVER use `graph LR` (left-right).
+    - Maximum node width should be 3-4 words.
+    - For sequence diagrams:
+        - Start with `sequenceDiagram` directive on its own line.
+        - Define ALL participants at the beginning.
+        - Use descriptive but concise participant names.
+        - Use the correct arrow types:
+            - `->>` for request/asynchronous messages
+            - `-->>` for response messages
+            - `-x` for failed messages
+        - Include activation boxes using `activate` and `deactivate` (or `+/-`) notation.
+        - Add notes for clarification using `Note over` or `Note right of`.
+</mermaid_diagram_rules>
+
 <style>
 - Use concise, direct language
 - Prioritize accuracy over verbosity

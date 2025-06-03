@@ -110,7 +110,14 @@ const Ask: React.FC<AskProps> = ({
       try {
         setIsLoading(true);
 
-        const response = await fetch('/api/models/config');
+        const baseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL;
+        if (!baseUrl) {
+          // Don't throw error here, as Ask component might be used where config is optional initially
+          console.warn("Server base URL is not configured for Ask component; model defaults may not load.");
+          setIsLoading(false);
+          return;
+        }
+        const response = await fetch(`${baseUrl}/models/config`);
 
         if (!response.ok) {
           throw new Error(`Error fetching model configurations: ${response.status}`);

@@ -20,9 +20,13 @@ export function useProcessedProjects() {
       setIsLoading(true);
       setError(null);
       try {
-        const response = await fetch('/api/wiki/projects');
+        const baseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL;
+        if (!baseUrl) {
+          throw new Error("Server base URL is not configured.");
+        }
+        const response = await fetch(`${baseUrl}/wiki/projects`);
         if (!response.ok) {
-          throw new Error(`Failed to fetch projects: ${response.statusText}`);
+          throw new Error(`Failed to fetch projects: ${response.statusText} (${response.status})`);
         }
         const data = await response.json();
         if (data.error) {

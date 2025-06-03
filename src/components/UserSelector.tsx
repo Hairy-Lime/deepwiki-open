@@ -86,7 +86,11 @@ export default function UserSelector({
         setIsLoading(true);
         setError(null);
 
-        const response = await fetch('/api/models/config');
+        const baseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL;
+        if (!baseUrl) {
+          throw new Error("Server base URL is not configured for UserSelector.");
+        }
+        const response = await fetch(`${baseUrl}/models/config`);
 
         if (!response.ok) {
           throw new Error(`Error fetching model configurations: ${response.status}`);

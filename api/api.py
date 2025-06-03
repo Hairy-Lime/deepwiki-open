@@ -132,7 +132,7 @@ class ModelConfig(BaseModel):
 from api.config import configs
 
 @app.get("/models/config", response_model=ModelConfig)
-async def get_model_config():
+async def get_model_config_endpoint():
     """
     Get available model providers and their models.
 
@@ -192,7 +192,7 @@ async def get_model_config():
         )
 
 @app.post("/export/wiki")
-async def export_wiki(request: WikiExportRequest):
+async def export_wiki_endpoint(request: WikiExportRequest):
     """
     Export wiki content as Markdown or JSON.
 
@@ -240,7 +240,7 @@ async def export_wiki(request: WikiExportRequest):
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/local_repo/structure")
-async def get_local_repo_structure(path: str = Query(None, description="Path to local repository")):
+async def get_local_repo_structure_endpoint(path: str = Query(None, description="Path to local repository")):
     """Return the file tree and README content for a local repository."""
     if not path:
         return JSONResponse(
@@ -421,7 +421,7 @@ async def save_wiki_cache(data: WikiCacheRequest) -> bool:
 # --- Wiki Cache API Endpoints ---
 
 @app.get("/wiki_cache", response_model=Optional[WikiCacheData])
-async def get_cached_wiki(
+async def get_cached_wiki_endpoint(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g., github, gitlab)"),
@@ -442,7 +442,7 @@ async def get_cached_wiki(
         return None
 
 @app.post("/wiki_cache")
-async def store_wiki_cache(request_data: WikiCacheRequest):
+async def store_wiki_cache_endpoint(request_data: WikiCacheRequest):
     """
     Stores generated wiki data (structure and pages) to the server-side cache.
     """
@@ -454,7 +454,7 @@ async def store_wiki_cache(request_data: WikiCacheRequest):
         raise HTTPException(status_code=500, detail="Failed to save wiki cache")
 
 @app.delete("/wiki_cache")
-async def delete_wiki_cache(
+async def delete_wiki_cache_endpoint(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
     repo_type: str = Query(..., description="Repository type (e.g., github, gitlab)"),
@@ -479,17 +479,8 @@ async def delete_wiki_cache(
         logger.warning(f"Wiki cache not found, cannot delete: {cache_path}")
         raise HTTPException(status_code=404, detail="Wiki cache not found")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for Docker and monitoring"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "service": "deepwiki-api"
-    }
-
 @app.post("/chat/stream")
-async def compat_stream(request: ChatCompletionRequest):
+async def compat_stream_endpoint(request: ChatCompletionRequest):
     return await chat_completions_stream(request)
 
 @app.get("/")
@@ -519,7 +510,7 @@ async def root():
 
 # --- Processed Projects Endpoint --- (New Endpoint)
 @app.get("/processed_projects", response_model=List[ProcessedProjectEntry])
-async def get_processed_projects():
+async def get_processed_projects_endpoint():
     """
     Lists all processed projects found in the wiki cache directory.
     Projects are identified by files named like: deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json
@@ -597,5 +588,14 @@ async def get_processed_projects():
         raise HTTPException(status_code=500, detail="Failed to list processed projects from server cache.")
         
 @app.get("/wiki/projects")
-async def alias_to_processed_projects():
-    return await get_processed_projects()
+async def alias_to_processed_projects_endpoint():
+    return await get_processed_projects_endpoint()
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Docker and monitoring"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "deepwiki-api"
+    }

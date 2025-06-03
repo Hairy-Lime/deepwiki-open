@@ -39,15 +39,10 @@ services:
       - "traefik.http.routers.deepwiki-api.rule=Host(`${HOST}`) && PathPrefix(`/api`)"
       - "traefik.http.routers.deepwiki-api.entrypoints=websecure"
       - "traefik.http.routers.deepwiki-api.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.deepwiki-api.middlewares=ipallowlist,deepwiki-headers"
+      - "traefik.http.routers.deepwiki-api.middlewares=ipallowlist"
       - "traefik.http.routers.deepwiki-api.service=deepwiki-api"
       - "traefik.http.services.deepwiki-api.loadbalancer.server.port=8001"
       - "traefik.http.services.deepwiki-api.loadbalancer.passhostheader=true"
-      
-      # WebSocket specific configuration
-      - "traefik.http.middlewares.deepwiki-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
-      - "traefik.http.middlewares.deepwiki-headers.headers.customrequestheaders.Connection=keep-alive, Upgrade"
-      - "traefik.http.middlewares.deepwiki-headers.headers.customrequestheaders.Upgrade=websocket"
 
     networks:
       - dokploy-network

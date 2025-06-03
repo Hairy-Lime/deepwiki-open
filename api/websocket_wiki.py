@@ -40,9 +40,9 @@ RATE_LIMIT_LOCK = asyncio.Lock()
 
 # --- Concurrency Limiter for WebSocket Handler ---
 try:
-    MAX_CONCURRENT_WIKI_JOBS = int(os.environ.get("MAX_CONCURRENT_WIKI_JOBS", 3))
+    MAX_CONCURRENT_WIKI_JOBS = int(os.environ.get("MAX_CONCURRENT_WIKI_JOBS", 1)) # Default changed to 1
 except ValueError:
-    MAX_CONCURRENT_WIKI_JOBS = 3
+    MAX_CONCURRENT_WIKI_JOBS = 1 # Default changed to 1
     logger.warning(f"Invalid MAX_CONCURRENT_WIKI_JOBS in environment, defaulting to {MAX_CONCURRENT_WIKI_JOBS}")
 WEBSOCKET_JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_WIKI_JOBS)
 logger.info(f"WebSocket job concurrency limit set to: {MAX_CONCURRENT_WIKI_JOBS}")

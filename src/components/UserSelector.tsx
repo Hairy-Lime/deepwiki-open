@@ -90,7 +90,7 @@ export default function UserSelector({
         if (!baseUrl) {
           throw new Error("Server base URL is not configured for UserSelector.");
         }
-        const response = await fetch(`${baseUrl}/models/config`);
+        const response = await fetch(`${baseUrl}/api/models/config`);
 
         if (!response.ok) {
           throw new Error(`Error fetching model configurations: ${response.status}`);

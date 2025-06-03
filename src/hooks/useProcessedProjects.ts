@@ -24,7 +24,7 @@ export function useProcessedProjects() {
         if (!baseUrl) {
           throw new Error("Server base URL is not configured.");
         }
-        const response = await fetch(`${baseUrl}/wiki/projects`);
+        const response = await fetch(`${baseUrl}/api/wiki/projects`);
         if (!response.ok) {
           throw new Error(`Failed to fetch projects: ${response.statusText} (${response.status})`);
         }

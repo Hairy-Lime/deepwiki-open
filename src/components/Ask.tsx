@@ -117,7 +117,7 @@ const Ask: React.FC<AskProps> = ({
           setIsLoading(false);
           return;
         }
-        const response = await fetch(`${baseUrl}/models/config`);
+        const response = await fetch(`${baseUrl}/api/models/config`);
 
         if (!response.ok) {
           throw new Error(`Error fetching model configurations: ${response.status}`);

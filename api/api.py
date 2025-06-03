@@ -131,7 +131,7 @@ class ModelConfig(BaseModel):
 
 from api.config import configs
 
-@app.get("/models/config", response_model=ModelConfig)
+@app.get("/api/models/config", response_model=ModelConfig)
 async def get_model_config_endpoint():
     """
     Get available model providers and their models.
@@ -191,7 +191,7 @@ async def get_model_config_endpoint():
             defaultProvider="google"
         )
 
-@app.post("/export/wiki")
+@app.post("/api/export/wiki")
 async def export_wiki_endpoint(request: WikiExportRequest):
     """
     Export wiki content as Markdown or JSON.
@@ -239,7 +239,7 @@ async def export_wiki_endpoint(request: WikiExportRequest):
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
 
-@app.get("/local_repo/structure")
+@app.get("/api/local_repo/structure")
 async def get_local_repo_structure_endpoint(path: str = Query(None, description="Path to local repository")):
     """Return the file tree and README content for a local repository."""
     if not path:
@@ -360,10 +360,10 @@ from api.simple_chat import chat_completions_stream, ChatCompletionRequest
 from api.websocket_wiki import handle_websocket_chat
 
 # Add the chat_completions_stream endpoint to the main app
-app.add_api_route("/chat/completions/stream", chat_completions_stream, methods=["POST"])
+app.add_api_route("/api/chat/completions/stream", chat_completions_stream, methods=["POST"])
 
 # Add the WebSocket endpoint
-app.add_websocket_route("/ws/chat", handle_websocket_chat)
+app.add_websocket_route("/api/ws/chat", handle_websocket_chat)
 
 # --- Wiki Cache Helper Functions ---
 
@@ -420,7 +420,7 @@ async def save_wiki_cache(data: WikiCacheRequest) -> bool:
 
 # --- Wiki Cache API Endpoints ---
 
-@app.get("/wiki_cache", response_model=Optional[WikiCacheData])
+@app.get("/api/wiki_cache", response_model=Optional[WikiCacheData])
 async def get_cached_wiki_endpoint(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
@@ -441,7 +441,7 @@ async def get_cached_wiki_endpoint(
         logger.info(f"Wiki cache not found for {owner}/{repo} ({repo_type}), lang: {language}, comprehensive: {comprehensive}")
         return None
 
-@app.post("/wiki_cache")
+@app.post("/api/wiki_cache")
 async def store_wiki_cache_endpoint(request_data: WikiCacheRequest):
     """
     Stores generated wiki data (structure and pages) to the server-side cache.
@@ -453,7 +453,7 @@ async def store_wiki_cache_endpoint(request_data: WikiCacheRequest):
     else:
         raise HTTPException(status_code=500, detail="Failed to save wiki cache")
 
-@app.delete("/wiki_cache")
+@app.delete("/api/wiki_cache")
 async def delete_wiki_cache_endpoint(
     owner: str = Query(..., description="Repository owner"),
     repo: str = Query(..., description="Repository name"),
@@ -479,7 +479,7 @@ async def delete_wiki_cache_endpoint(
         logger.warning(f"Wiki cache not found, cannot delete: {cache_path}")
         raise HTTPException(status_code=404, detail="Wiki cache not found")
 
-@app.post("/chat/stream")
+@app.post("/api/chat/stream")
 async def compat_stream_endpoint(request: ChatCompletionRequest):
     return await chat_completions_stream(request)
 
@@ -509,7 +509,7 @@ async def root():
     }
 
 # --- Processed Projects Endpoint --- (New Endpoint)
-@app.get("/processed_projects", response_model=List[ProcessedProjectEntry])
+@app.get("/api/processed_projects", response_model=List[ProcessedProjectEntry])
 async def get_processed_projects_endpoint():
     """
     Lists all processed projects found in the wiki cache directory.
@@ -587,7 +587,7 @@ async def get_processed_projects_endpoint():
         logger.error(f"Error listing processed projects from {WIKI_CACHE_DIR}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list processed projects from server cache.")
         
-@app.get("/wiki/projects")
+@app.get("/api/wiki/projects")
 async def alias_to_processed_projects_endpoint():
     return await get_processed_projects_endpoint()
 

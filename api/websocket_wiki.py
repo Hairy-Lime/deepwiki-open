@@ -688,8 +688,16 @@ This file contains...
             else: # Google
                 response = model.generate_content(prompt, stream=True)
                 for chunk in response:
-                    if hasattr(chunk, 'text'):
-                        await websocket.send_text(chunk.text)
+                    # Check if the chunk has parts and iterate through them
+                    if chunk.parts:
+                        for part in chunk.parts:
+                            if hasattr(part, 'text') and part.text:
+                                await websocket.send_text(part.text)
+                    # Handle cases where generation might have stopped without valid parts (e.g. safety reasons)
+                    elif chunk.candidates and chunk.candidates[0].finish_reason.name != 'STOP' and chunk.candidates[0].finish_reason.name != 'UNSPECIFIED':
+                        logger.warning(f"Chunk processing stopped. Finish Reason: {chunk.candidates[0].finish_reason.name}")
+                        # Optionally send a message to client or break, depending on desired behavior
+                        # For now, we just log and continue, but might be better to break or send an error marker.
                 await websocket.close()
 
         except Exception as e_outer:

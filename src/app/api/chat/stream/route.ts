@@ -15,7 +15,7 @@ export async function POST(req: NextRequest) {
     // This HTTP endpoint is kept for backward compatibility
     console.log('Using HTTP fallback for chat completion instead of WebSockets');
 
-    const targetUrl = `${TARGET_SERVER_BASE_URL}/chat/stream`;
+    const targetUrl = `${TARGET_SERVER_BASE_URL}/api/chat/stream`;
 
     // Make the actual request to the backend service
     const backendResponse = await fetch(targetUrl, {

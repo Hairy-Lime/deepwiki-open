@@ -70,6 +70,50 @@ async def enforce_llm_rate_limit():
 MAX_RAG_CONTEXT_TOKENS = 10000  # Max tokens for the RAG-retrieved context_text
 MAX_OVERALL_PROMPT_TOKENS = 24000 # Revised based on observed issues with ~26k user message content.
 
+# Token limits by provider
+PROVIDER_TOKEN_LIMITS = {
+    "google": {
+        "gemini-2.0-flash": 1048576,  # 1M context window
+        "gemini-2.0-flash-experimental": 1048576,
+        "gemini-2.0-pro": 2097152,  # 2M context window
+        "gemini-2.5-pro-preview-0409": 2097152,
+        "gemini-2.5-pro-preview-05-06": 2097152,
+        "gemini-2.5-flash": 1048576,
+        "gemini-2.5-flash-preview-01-11": 1048576,
+        "gemini-2.5-flash-preview-05-20": 1048576,
+        "gemini-1.5-pro": 2097152,
+        "gemini-1.5-flash": 1048576,
+        "default": 32768  # Conservative default
+    },
+    "openai": {
+        "gpt-4": 8192,
+        "gpt-4-32k": 32768,
+        "gpt-4-turbo": 128000,
+        "gpt-4-turbo-preview": 128000,
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+        "gpt-3.5-turbo": 16384,
+        "default": 8192
+    },
+    "openrouter": {
+        "default": 128000  # Most OpenRouter models support large contexts
+    },
+    "ollama": {
+        "default": 8192  # Conservative default for local models
+    }
+}
+
+def get_model_token_limit(provider: str, model: str) -> int:
+    """Get the token limit for a specific provider and model."""
+    provider_limits = PROVIDER_TOKEN_LIMITS.get(provider, {})
+    return provider_limits.get(model, provider_limits.get("default", 32768))
+
+def calculate_safe_prompt_limit(provider: str, model: str) -> int:
+    """Calculate a safe prompt limit based on the model's context window."""
+    model_limit = get_model_token_limit(provider, model)
+    # Use 80% of the model's limit as a safety margin
+    return int(model_limit * 0.8)
+
 def truncate_text_by_tokens(text: str, max_tokens: int, is_ollama: bool = False) -> tuple[str, bool]:
     """Truncates text to a maximum number of tokens. Returns (truncated_text, was_truncated)."""
     original_tokens = count_tokens(text, is_ollama)
@@ -171,15 +215,22 @@ async def handle_websocket_chat(websocket: WebSocket):
         # Check if request contains very large input (basic check on last message)
         input_too_large = False
         last_message_content_tokens = 0
+        is_ollama_provider = request.provider == "ollama"
+        model_name = request.model or get_model_config(request.provider, request.model)["model_kwargs"]["model"]
+        safe_prompt_limit = calculate_safe_prompt_limit(request.provider, model_name)
+        
         if request.messages and len(request.messages) > 0:
             last_message = request.messages[-1]
             if hasattr(last_message, 'content') and last_message.content:
-                is_ollama_provider = request.provider == "ollama"
                 last_message_content_tokens = count_tokens(last_message.content, is_ollama_provider)
                 logger.info(f"Last message content size: {last_message_content_tokens} tokens")
-                # This threshold determines if RAG is skipped due to potentially very large user input
-                if last_message_content_tokens > 20000: # Increased this threshold as RAG is now the main thing to manage for size
-                    logger.warning(f"Last message content ({last_message_content_tokens} tokens) is very large, RAG will be skipped.")
+                logger.info(f"Safe prompt limit for {request.provider}/{model_name}: {safe_prompt_limit} tokens")
+                
+                # Adjust threshold based on model capabilities
+                rag_skip_threshold = min(safe_prompt_limit * 0.5, 20000)  # Use 50% of safe limit or 20k, whichever is smaller
+                
+                if last_message_content_tokens > rag_skip_threshold:
+                    logger.warning(f"Last message content ({last_message_content_tokens} tokens) exceeds RAG threshold ({rag_skip_threshold} tokens), RAG will be skipped.")
                     input_too_large = True
 
         # Create a new RAG instance for this request
@@ -264,6 +315,7 @@ async def handle_websocket_chat(websocket: WebSocket):
 
         query = last_message.content
         context_text = ""
+        CONTEXT_START = "<START_OF_CONTEXT>"  # Define the context delimiter
         if not input_too_large:
             try:
                 rag_query = query
@@ -283,19 +335,45 @@ async def handle_websocket_chat(websocket: WebSocket):
                         docs_by_file[file_path_meta].append(doc)
                     context_parts = [f"## File Path: {fp}\\n\\n" + "\\n\\n".join([d.text for d in docs_in_file]) for fp, docs_in_file in docs_by_file.items()]
                     context_text = "\\n\\n" + "----------\\n\\n".join(context_parts)
-                    # Simple truncation for RAG context if it's extremely large, to avoid dominating the prompt entirely
-                    # This is a basic safeguard for RAG context only.
-                    # The primary concern for overall prompt size is the main user instruction.
-                    # A very large RAG context can still be an issue if the initial user prompt is also huge.
-                    # Let's set a simpler, higher threshold for RAG context alone.
-                    # Max 15k tokens for RAG, this may still be too large combined with huge user input.
-                    rag_context_tokens = count_tokens(context_text, request.provider == "ollama")
-                    if rag_context_tokens > 15000:
-                        logger.warning(f"RAG context is very large ({rag_context_tokens} tokens). Truncating RAG context to ~15000 tokens.")
-                        # Simple character-based truncation for this basic safeguard
-                        estimated_chars = 15000 * 4 
-                        context_text = context_text[:estimated_chars] + "... (RAG context truncated)"
-                        logger.info(f"Truncated RAG context token count: {count_tokens(context_text, request.provider == 'ollama')}")
+                    
+                    # Calculate available token budget for RAG context
+                    # We need to reserve tokens for: system prompt, conversation history, file content, and user query
+                    estimated_system_prompt_tokens = 1500  # Conservative estimate
+                    conversation_history = ""
+                    for turn_id, turn in request_rag.memory().items():
+                        if not isinstance(turn_id, int) and hasattr(turn, 'user_query') and hasattr(turn, 'assistant_response'):
+                            conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
+                    conversation_history_tokens = count_tokens(conversation_history, is_ollama_provider) if conversation_history else 0
+                    file_content_tokens = 0
+                    if request.filePath:
+                        try:
+                            temp_file_content = get_file_content(request.repo_url, request.filePath, request.type, request.token)
+                            file_content_tokens = count_tokens(temp_file_content, is_ollama_provider)
+                        except:
+                            file_content_tokens = 0
+                    
+                    # Calculate remaining budget for RAG context
+                    used_tokens = (estimated_system_prompt_tokens + 
+                                  conversation_history_tokens + 
+                                  file_content_tokens + 
+                                  last_message_content_tokens + 
+                                  500)  # Buffer for formatting
+                    
+                    available_rag_tokens = safe_prompt_limit - used_tokens
+                    max_rag_tokens = min(available_rag_tokens, MAX_RAG_CONTEXT_TOKENS)
+                    
+                    logger.info(f"Token budget calculation: safe_limit={safe_prompt_limit}, used={used_tokens}, available_for_rag={available_rag_tokens}, max_rag={max_rag_tokens}")
+                    
+                    # Truncate RAG context if necessary
+                    rag_context_tokens = count_tokens(context_text, is_ollama_provider)
+                    if rag_context_tokens > max_rag_tokens and max_rag_tokens > 0:
+                        logger.warning(f"RAG context ({rag_context_tokens} tokens) exceeds budget ({max_rag_tokens} tokens). Truncating.")
+                        context_text, was_truncated = truncate_text_by_tokens(context_text, max_rag_tokens, is_ollama_provider)
+                        if was_truncated:
+                            context_text += "\\n\\n(Note: Context was truncated to fit within token limits)"
+                    elif max_rag_tokens <= 0:
+                        logger.warning("No token budget available for RAG context. Skipping RAG.")
+                        context_text = ""
                 else:
                     logger.warning("No documents retrieved from RAG")
             except Exception as e:
@@ -490,12 +568,50 @@ This file contains...
         prompt = "\\n\\n".join(prompt_parts)
         prompt += "\\n\\nAssistant:"
         
-        # Log final prompt for debugging (optional, can be very verbose)
-        # logger.debug(f"Final assembled prompt:\\n{prompt}")
-        final_prompt_token_count = count_tokens(prompt, request.provider == "ollama")
+        # Calculate and validate final prompt size
+        final_prompt_token_count = count_tokens(prompt, is_ollama_provider)
         logger.info(f"Final assembled prompt token count: {final_prompt_token_count}")
-        if final_prompt_token_count > 30000: # A general warning if prompt is very large, e.g. > 30k
-            logger.warning(f"WARNING: Final prompt token count ({final_prompt_token_count}) is very large and may exceed model limits or cause performance issues.")
+        
+        if final_prompt_token_count > safe_prompt_limit:
+            logger.warning(f"Final prompt ({final_prompt_token_count} tokens) exceeds safe limit ({safe_prompt_limit} tokens)")
+            
+            # Attempt to reduce prompt size by removing less critical components
+            # Priority order: 1) Keep user query, 2) Keep system prompt, 3) Reduce context, 4) Reduce conversation history
+            
+            # First, try removing/reducing context
+            if context_text.strip():
+                logger.info("Attempting to reduce prompt size by removing RAG context")
+                prompt_parts_reduced = [p for p in prompt_parts if not (CONTEXT_START in p or context_text in p)]
+                prompt_reduced = "\\n\\n".join(prompt_parts_reduced) + "\\n\\nAssistant:"
+                reduced_token_count = count_tokens(prompt_reduced, is_ollama_provider)
+                
+                if reduced_token_count <= safe_prompt_limit:
+                    prompt = prompt_reduced
+                    final_prompt_token_count = reduced_token_count
+                    logger.info(f"Reduced prompt to {final_prompt_token_count} tokens by removing context")
+                else:
+                    # If still too large, try truncating conversation history
+                    if conversation_history:
+                        logger.info("Still too large, attempting to truncate conversation history")
+                        # Keep only the most recent exchanges
+                        conv_parts = conversation_history.split("<turn>")
+                        if len(conv_parts) > 3:  # Keep only last 2 turns
+                            recent_conv = "<turn>".join(conv_parts[-3:])
+                            prompt_parts_minimal = [prompt_base]
+                            if recent_conv:
+                                prompt_parts_minimal.append(f"<conversation_history>\\n{recent_conv}</conversation_history>")
+                            if file_content:
+                                prompt_parts_minimal.append(f"<currentFileContent path=\\\"{request.filePath}\\\">\\n{file_content}\\n</currentFileContent>")
+                            if not is_deep_research and query != prompt_base:
+                                prompt_parts_minimal.append(f"<query>\\n{query}\\n</query>")
+                            
+                            prompt_minimal = "\\n\\n".join(prompt_parts_minimal) + "\\n\\nAssistant:"
+                            minimal_token_count = count_tokens(prompt_minimal, is_ollama_provider)
+                            
+                            if minimal_token_count <= safe_prompt_limit:
+                                prompt = prompt_minimal
+                                final_prompt_token_count = minimal_token_count
+                                logger.info(f"Reduced prompt to {final_prompt_token_count} tokens by truncating conversation history")
 
         model_config = get_model_config(request.provider, request.model)["model_kwargs"]
 

@@ -2,14 +2,20 @@ import os
 import logging
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from typing import List, Optional, Dict, Any, Literal
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from typing import List, Optional, Dict, Any, Literal, AsyncGenerator
 import json
 from datetime import datetime
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 import asyncio
 import adalflow.utils.global_config
+
+# Import the refactored processing logic and request model
+from api.websocket_wiki import (
+    _process_chat_request_logic, 
+    ChatCompletionRequest as WebSocketChatCompletionRequest
+)
 
 def custom_root_path():
     return os.environ.get('ADALFLOW_ROOT_PATH')
@@ -132,7 +138,7 @@ class ModelConfig(BaseModel):
 from api.config import configs
 
 @app.get("/api/models/config", response_model=ModelConfig)
-async def get_model_config():
+async def get_model_config_endpoint():
     """
     Get available model providers and their models.
 
@@ -599,3 +605,34 @@ async def get_processed_projects():
 @app.get("/api/wiki/projects")
 async def alias_to_processed_projects():
     return await get_processed_projects()
+
+# --- New HTTP Streaming Endpoint ---
+@app.post("/api/chat/completions/http_stream")
+async def http_advanced_chat_stream(request: WebSocketChatCompletionRequest):
+    """
+    HTTP endpoint for streaming chat completions, using the advanced processing logic.
+    This is intended as a more robust fallback or alternative to the WebSocket.
+    """
+    try:
+        logger.info(f"HTTP Stream request received for repo: {request.repo_url}")
+        
+        async def stream_generator():
+            try:
+                async for chunk in _process_chat_request_logic(request):
+                    if chunk.startswith("Error:"):
+                        logger.warning(f"Error chunk in HTTP stream: {chunk}")
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+                yield f"data: {json.dumps({'event': 'stream_end'})}\n\n"
+            except Exception as e_stream_gen:
+                logger.error(f"Error within HTTP stream_generator: {str(e_stream_gen)}", exc_info=True)
+                error_payload = {"error": "An error occurred during stream generation.", "detail": str(e_stream_gen)}
+                yield f"data: {json.dumps(error_payload)}\n\n"
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    
+    except HTTPException as http_exc:
+        logger.error(f"HTTPException directly in HTTP stream endpoint: {http_exc.detail}", exc_info=True)
+        return JSONResponse(status_code=http_exc.status_code, content={"detail": http_exc.detail})
+    except Exception as e:
+        logger.error(f"Unexpected error in HTTP stream endpoint: {str(e)}", exc_info=True)
+        return JSONResponse(status_code=500, content={"detail": f"An unexpected server error occurred: {str(e)}"})

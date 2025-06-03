@@ -1,18 +1,19 @@
 import logging
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
 from urllib.parse import unquote
 import asyncio
 import time # Added for rate limiter
 from collections import deque # Added for rate limiter
 
 import google.generativeai as genai
+from google.generativeai.types import GenerateContentResponse, Candidate, BlockedPromptException, generation_types
 from adalflow.components.model_client.ollama_client import OllamaClient
 from adalflow.core.types import ModelType
-from fastapi import WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import WebSocket, WebSocketDisconnect, HTTPException, WebSocketState
 from pydantic import BaseModel, Field
 
-from api.config import get_model_config
+from api.config import get_model_config as get_llm_config # Alias to avoid confusion
 from api.data_pipeline import count_tokens, get_file_content
 from api.openai_client import OpenAIClient
 from api.openrouter_client import OpenRouterClient
@@ -21,299 +22,233 @@ from api.rag import RAG
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(lineno)d %(filename)s:%(funcName)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 # --- Rate Limiter Configuration ---
-LLM_REQUEST_TIMESTAMPS = deque()
-LLM_RPM_LIMIT = 100  # Requests Per Minute
+LLM_RPM_LIMITS: Dict[str, int] = {
+    "google": 150,
+    "openai": 60, 
+    "openrouter": 60, 
+    "ollama": 1000, 
+    "default": 30
+}
+LLM_REQUEST_TIMESTAMPS: Dict[str, deque] = {provider: deque() for provider in LLM_RPM_LIMITS.keys()}
+LLM_REQUEST_TIMESTAMPS["default"] = deque()
 LLM_RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_LOCK = asyncio.Lock()
 
-async def enforce_llm_rate_limit():
+async def enforce_llm_rate_limit(provider: str):
     async with RATE_LIMIT_LOCK:
         now = time.monotonic()
-        
-        # Remove timestamps older than the window
-        while LLM_REQUEST_TIMESTAMPS and LLM_REQUEST_TIMESTAMPS[0] <= now - LLM_RATE_LIMIT_WINDOW_SECONDS:
-            LLM_REQUEST_TIMESTAMPS.popleft()
-            
-        if len(LLM_REQUEST_TIMESTAMPS) >= LLM_RPM_LIMIT:
-            oldest_relevant_timestamp = LLM_REQUEST_TIMESTAMPS[0]
+        current_rpm_limit = LLM_RPM_LIMITS.get(provider, LLM_RPM_LIMITS["default"])
+        provider_timestamps = LLM_REQUEST_TIMESTAMPS.get(provider, LLM_REQUEST_TIMESTAMPS["default"])
+        while provider_timestamps and provider_timestamps[0] <= now - LLM_RATE_LIMIT_WINDOW_SECONDS:
+            provider_timestamps.popleft()
+        if len(provider_timestamps) >= current_rpm_limit:
+            oldest_relevant_timestamp = provider_timestamps[0]
             wait_time = (oldest_relevant_timestamp + LLM_RATE_LIMIT_WINDOW_SECONDS) - now
             if wait_time > 0:
-                logger.info(f"Rate limit reached ({LLM_RPM_LIMIT} RPM). Waiting for {wait_time:.2f} seconds.")
+                logger.info(f"Rate limit for {provider} reached ({current_rpm_limit} RPM). Waiting for {wait_time:.2f} seconds.")
                 await asyncio.sleep(wait_time)
-                # Re-clean after waiting
-                now = time.monotonic() # Update current time
-                while LLM_REQUEST_TIMESTAMPS and LLM_REQUEST_TIMESTAMPS[0] <= now - LLM_RATE_LIMIT_WINDOW_SECONDS:
-                    LLM_REQUEST_TIMESTAMPS.popleft()
+                now = time.monotonic()
+                while provider_timestamps and provider_timestamps[0] <= now - LLM_RATE_LIMIT_WINDOW_SECONDS:
+                    provider_timestamps.popleft()
+        provider_timestamps.append(now)
 
-        LLM_REQUEST_TIMESTAMPS.append(now)
-# --- End Rate Limiter ---
+# --- Token Budget Configuration ---
+MODEL_MAX_CONTEXT_WINDOW_TOKENS = 32000 
+DESIRED_MAX_OUTPUT_TOKENS = 4096    
+MAX_EFFECTIVE_PROMPT_TOKENS = MODEL_MAX_CONTEXT_WINDOW_TOKENS - DESIRED_MAX_OUTPUT_TOKENS
 
-# Define a safety margin for token limits
-# (e.g., Gemini 2.5 Pro has a 32k context window, but prompts can be large)
-# Let's aim for a prompt significantly smaller than the absolute max.
-# The previous check was at 8000, and warnings were for > 7500.
-# Let's set a more conservative overall prompt limit.
-# Considering the detailed system prompts, a 16k limit for the *entire assembled prompt*
-# before sending to the LLM might be a safer starting point.
-# The actual model context window is much larger (e.g., 32k for Gemini 2.5 Pro, or even 1M+ for others)
-# but the issue arises from the prompt itself being too large for *this specific application's typical request structure*.
-# The 7500 limit was for the user message content alone.
-# Let's refine this. The core issue is the final assembled prompt for the LLM.
-# The Google model previously errored when the *request size* (which seems to be just the last message) was 26858.
-# This suggests that the other parts of the prompt (system message, RAG context) add to this.
-# Let's set a target for the RAG context itself.
-MAX_RAG_CONTEXT_TOKENS = 10000  # Max tokens for the RAG-retrieved context_text
-MAX_OVERALL_PROMPT_TOKENS = 24000 # Revised based on observed issues with ~26k user message content.
+BUDGET_SYSTEM_PROMPT_TARGET = 4000
+BUDGET_QUERY_TARGET = 8000 
+BUDGET_FILE_CONTENT_TARGET = 7000
+BUDGET_SUMMARIZED_FILE_CONTENT_TARGET = 2000
+BUDGET_HISTORY_TARGET = 5000
+BUDGET_RAG_CONTEXT_TARGET = 10000
+MIN_TOKENS_FOR_QUERY = 100
+MIN_TOKENS_FOR_CONTEXT = 200
 
-def truncate_text_by_tokens(text: str, max_tokens: int, is_ollama: bool = False) -> tuple[str, bool]:
-    """Truncates text to a maximum number of tokens. Returns (truncated_text, was_truncated)."""
-    original_tokens = count_tokens(text, is_ollama)
-    if original_tokens <= max_tokens:
-        return text, False
+# --- Helper Functions ---
+def get_token_count_for_provider(text: str, provider: str, model_name: Optional[str] = None) -> int:
+    is_ollama = provider == "ollama"
+    return count_tokens(text, is_ollama_provider=is_ollama)
 
-    # Simple truncation for now, could be made smarter (e.g., sentence boundaries)
-    # For simplicity, let's try a character-based approximation for truncation.
-    avg_chars_per_token = 4  # This is a rough estimate
-    estimated_chars_to_keep = max_tokens * avg_chars_per_token
-    
-    truncated_text = text[:estimated_chars_to_keep]
-    
-    # Recalculate tokens and adjust if still over (e.g., due to UTF-8 or tokenization nuances)
-    loop_count = 0 # Safety break for loop
-    while count_tokens(truncated_text, is_ollama) > max_tokens and len(truncated_text) > 0 and loop_count < 100:
-        truncated_text = truncated_text[:-100] # Reduce by a chunk
-        if not truncated_text: # Safety break
-            break
-        loop_count += 1
-            
-    # Final check, if still over after rough truncation, do a more precise (but slower) word by word.
-    if count_tokens(truncated_text, is_ollama) > max_tokens:
-        words = text.split() # split by space, not ideal for all languages but a start
+def truncate_text_by_tokens(text: str, max_tokens: int, provider: str, model_name: Optional[str] = None) -> Tuple[str, bool, int]:
+    if not text: return "", False, 0
+    original_tokens = get_token_count_for_provider(text, provider, model_name)
+    if original_tokens <= max_tokens: return text, False, original_tokens
+    estimated_chars_per_token = 3.5 
+    chars_to_keep = int(max_tokens * estimated_chars_per_token)
+    truncated_text = text[:chars_to_keep]
+    current_tokens = get_token_count_for_provider(truncated_text, provider, model_name)
+    loop_safety = 0
+    while current_tokens > max_tokens and len(truncated_text) > 10 and loop_safety < 20:
+        excess_chars = int(len(truncated_text) * 0.1)
+        truncated_text = truncated_text[:-max(10, excess_chars)] 
+        current_tokens = get_token_count_for_provider(truncated_text, provider, model_name)
+        loop_safety += 1
+    if current_tokens > max_tokens:
+        words = text.split()
         truncated_words = []
         current_word_tokens = 0
         for word in words:
-            word_with_space = word + " "
-            # Check token count of current word + space, or word itself if it's the last one or too long
-            word_tokens = count_tokens(word_with_space, is_ollama)
+            word_plus_space = word + " "
+            word_tokens = get_token_count_for_provider(word_plus_space, provider, model_name)
             if current_word_tokens + word_tokens <= max_tokens:
                 truncated_words.append(word)
                 current_word_tokens += word_tokens
-            else:
-                # If even a single word is too long, try to truncate it (very basic)
-                if not truncated_words and count_tokens(word, is_ollama) > max_tokens:
-                    truncated_word, _ = truncate_text_by_tokens(word, max_tokens, is_ollama) # Recursive call for a single word
-                    truncated_words.append(truncated_word)
-                    current_word_tokens += count_tokens(truncated_word, is_ollama)
-                break
+            else: break
         truncated_text = " ".join(truncated_words)
+        current_tokens = get_token_count_for_provider(truncated_text, provider, model_name)
+    was_truncated = current_tokens < original_tokens
+    suffix = "... (truncated)" if was_truncated else ""
+    if was_truncated: logger.warning(f"Truncated text from {original_tokens} to {current_tokens} tokens (limit: {max_tokens}).")
+    return truncated_text + suffix, was_truncated, current_tokens
 
-    final_tokens = count_tokens(truncated_text, is_ollama)
-    was_actually_truncated = final_tokens < original_tokens
-    
-    if was_actually_truncated:
-        logger.warning(f"Truncated text from {original_tokens} to {final_tokens} tokens to fit token limit of {max_tokens}.")
-        return truncated_text + "... (truncated)", True
-    else:
-        # This case implies original_tokens <= max_tokens, or truncation didn't reduce it (e.g. single very long token)
-        return truncated_text, False
+async def summarize_content_with_llm(
+    content_to_summarize: str, 
+    contextual_query: str, 
+    file_path_hint: str,
+    target_token_count: int,
+    request_provider: str, 
+    request_model_name: Optional[str],
+    language_name: str
+) -> Tuple[Optional[str], int]:
+    logger.info(f"Attempting to summarize content from '{file_path_hint}' for query context, target tokens: {target_token_count}")
+    summarization_system_prompt = f"""You are an expert text summarizer. Your task is to concisely summarize the following content from the file '{file_path_hint}'. 
+The summary MUST be relevant to this user query: '{contextual_query}'. 
+Focus on extracting essential details, function definitions, configurations, or explanations that directly help address or understand the query. 
+Aim for a summary of approximately {target_token_count // 2} to {target_token_count} tokens. 
+Respond ONLY with the summary text, without any preamble. Respond in {language_name}."""
+    summarization_prompt = f"{summarization_system_prompt}\n\n<CONTENT_TO_SUMMARIZE>\n{content_to_summarize}\n</CONTENT_TO_SUMMARIZE>\n\nSummary:"
+    summary_provider = request_provider
+    summary_model_name = request_model_name
+    try:
+        summary_config = get_llm_config(summary_provider, summary_model_name)["model_kwargs"]
+        api_kwargs_summary: Dict[str, Any] = {}
+        llm_client_summary: Any = None
+        if summary_provider == "google":
+            if not google_api_key: return None, 0
+            llm_client_summary = genai.GenerativeModel(
+                model_name=summary_config.get("model", "gemini-1.5-flash-latest"),
+                generation_config={"temperature": 0.3, "top_p": 0.9, "max_output_tokens": target_token_count + 500}
+            )
+            await enforce_llm_rate_limit(summary_provider)
+            response = await llm_client_summary.generate_content_async(summarization_prompt)
+            summarized_text = response.text if hasattr(response, 'text') else ""
+        elif summary_provider in ["openai", "openrouter", "ollama"]:
+            if summary_provider == "openai": llm_client_summary = OpenAIClient()
+            elif summary_provider == "openrouter": llm_client_summary = OpenRouterClient()
+            else: llm_client_summary = OllamaClient()
+            model_kwargs_summary = {
+                "model": summary_config.get("model"), 
+                "stream": False, 
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "max_tokens": target_token_count + 500
+            }
+            if summary_provider == "ollama":
+                model_kwargs_summary["options"] = {"temperature": 0.3, "top_p": 0.9, "num_ctx": summary_config.get("options", {}).get("num_ctx", 4096)}
+            api_kwargs_summary = llm_client_summary.convert_inputs_to_api_kwargs(input=summarization_prompt, model_kwargs=model_kwargs_summary, model_type=ModelType.LLM)
+            await enforce_llm_rate_limit(summary_provider)
+            response = await llm_client_summary.acall(api_kwargs=api_kwargs_summary, model_type=ModelType.LLM)
+            summarized_text = response.choices[0].message.content if summary_provider != "ollama" and response.choices else getattr(response, 'response', "")
+        else:
+            logger.error(f"Unsupported provider for summarization: {summary_provider}")
+            return None, 0
+        if summarized_text:
+            final_summary_tokens = get_token_count_for_provider(summarized_text, summary_provider, summary_model_name)
+            logger.info(f"Successfully summarized content from '{file_path_hint}'. Original approx tokens: {get_token_count_for_provider(content_to_summarize, summary_provider, summary_model_name)}, Summary tokens: {final_summary_tokens}")
+            return summarized_text, final_summary_tokens
+        else:
+            logger.warning(f"LLM summarization for '{file_path_hint}' returned empty content.")
+            return None, 0
+    except Exception as e_summary:
+        logger.error(f"Error during LLM summarization for '{file_path_hint}': {str(e_summary)}", exc_info=True)
+        return None, 0
 
-# Get API keys from environment variables
 google_api_key = os.environ.get('GOOGLE_API_KEY')
+if google_api_key: genai.configure(api_key=google_api_key)
+else: logger.warning("GOOGLE_API_KEY not found")
 
-# Configure Google Generative AI
-if google_api_key:
-    genai.configure(api_key=google_api_key)
-else:
-    logger.warning("GOOGLE_API_KEY not found in environment variables")
-
-# Models for the API
 class ChatMessage(BaseModel):
-    role: str  # 'user' or 'assistant'
+    role: str
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    """
-    Model for requesting a chat completion.
-    """
     repo_url: str = Field(..., description="URL of the repository to query")
     messages: List[ChatMessage] = Field(..., description="List of chat messages")
     filePath: Optional[str] = Field(None, description="Optional path to a file in the repository to include in the prompt")
     token: Optional[str] = Field(None, description="Personal access token for private repositories")
     type: Optional[str] = Field("github", description="Type of repository (e.g., 'github', 'gitlab', 'bitbucket')")
-
-    # model parameters
     provider: str = Field("google", description="Model provider (google, openai, openrouter, ollama)")
     model: Optional[str] = Field(None, description="Model name for the specified provider")
+    language: Optional[str] = Field("en", description="Language for content generation")
+    excluded_dirs: Optional[str] = Field(None)
+    excluded_files: Optional[str] = Field(None)
+    included_dirs: Optional[str] = Field(None)
+    included_files: Optional[str] = Field(None)
 
-    language: Optional[str] = Field("en", description="Language for content generation (e.g., 'en', 'ja', 'zh', 'es', 'kr', 'vi')")
-    excluded_dirs: Optional[str] = Field(None, description="Comma-separated list of directories to exclude from processing")
-    excluded_files: Optional[str] = Field(None, description="Comma-separated list of file patterns to exclude from processing")
-    included_dirs: Optional[str] = Field(None, description="Comma-separated list of directories to include exclusively")
-    included_files: Optional[str] = Field(None, description="Comma-separated list of file patterns to include exclusively")
-
-async def handle_websocket_chat(websocket: WebSocket):
-    """
-    Handle WebSocket connection for chat completions.
-    This replaces the HTTP streaming endpoint with a WebSocket connection.
-    """
-    await websocket.accept()
-
+async def _process_chat_request_logic(request_model: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+    """Core logic for processing chat requests and streaming LLM responses."""
     try:
-        # Receive and parse the request data
-        request_data = await websocket.receive_json()
-        request = ChatCompletionRequest(**request_data)
+        logger.info(f"Processing chat request logic for repo: {request_model.repo_url}, provider: {request_model.provider}, model: {request_model.model}")
+        request_rag = RAG(provider=request_model.provider, model=request_model.model)
+        excluded_dirs_list = [unquote(d) for d in (request_model.excluded_dirs or "").split('\\n') if d.strip()]
+        excluded_files_list = [unquote(f) for f in (request_model.excluded_files or "").split('\\n') if f.strip()]
+        included_dirs_list = [unquote(d) for d in (request_model.included_dirs or "").split('\\n') if d.strip()]
+        included_files_list = [unquote(f) for f in (request_model.included_files or "").split('\\n') if f.strip()]
+        request_rag.prepare_retriever(
+            request_model.repo_url, request_model.type, request_model.token,
+            excluded_dirs_list, excluded_files_list, included_dirs_list, included_files_list
+        )
+        logger.info(f"Retriever prepared for {request_model.repo_url}")
 
-        # Check if request contains very large input (basic check on last message)
-        input_too_large = False
-        last_message_content_tokens = 0
-        if request.messages and len(request.messages) > 0:
-            last_message = request.messages[-1]
-            if hasattr(last_message, 'content') and last_message.content:
-                is_ollama_provider = request.provider == "ollama"
-                last_message_content_tokens = count_tokens(last_message.content, is_ollama_provider)
-                logger.info(f"Last message content size: {last_message_content_tokens} tokens")
-                # This threshold determines if RAG is skipped due to potentially very large user input
-                if last_message_content_tokens > 20000: # Increased this threshold as RAG is now the main thing to manage for size
-                    logger.warning(f"Last message content ({last_message_content_tokens} tokens) is very large, RAG will be skipped.")
-                    input_too_large = True
-
-        # Create a new RAG instance for this request
-        try:
-            request_rag = RAG(provider=request.provider, model=request.model)
-
-            excluded_dirs = [unquote(dir_path) for dir_path in (request.excluded_dirs or "").split('\\n') if dir_path.strip()]
-            excluded_files = [unquote(file_pattern) for file_pattern in (request.excluded_files or "").split('\\n') if file_pattern.strip()]
-            included_dirs = [unquote(dir_path) for dir_path in (request.included_dirs or "").split('\\n') if dir_path.strip()]
-            included_files = [unquote(file_pattern) for file_pattern in (request.included_files or "").split('\\n') if file_pattern.strip()]
-            
-            if excluded_dirs: logger.info(f"Using custom excluded directories: {excluded_dirs}")
-            if excluded_files: logger.info(f"Using custom excluded files: {excluded_files}")
-            if included_dirs: logger.info(f"Using custom included directories: {included_dirs}")
-            if included_files: logger.info(f"Using custom included files: {included_files}")
-
-            request_rag.prepare_retriever(request.repo_url, request.type, request.token, excluded_dirs, excluded_files, included_dirs, included_files)
-            logger.info(f"Retriever prepared for {request.repo_url}")
-        except ValueError as e:
-            if "No valid documents with embeddings found" in str(e):
-                logger.error(f"No valid embeddings found: {str(e)}")
-                await websocket.send_text("Error: No valid document embeddings found. This may be due to embedding size inconsistencies or API errors during document processing. Please try again or check your repository content.")
-                await websocket.close()
-                return
-            else:
-                logger.error(f"ValueError preparing retriever: {str(e)}")
-                await websocket.send_text(f"Error preparing retriever: {str(e)}")
-                await websocket.close()
-                return
-        except Exception as e:
-            logger.error(f"Error preparing retriever: {str(e)}")
-            if "All embeddings should be of the same size" in str(e):
-                await websocket.send_text("Error: Inconsistent embedding sizes detected. Some documents may have failed to embed properly. Please try again.")
-            else:
-                await websocket.send_text(f"Error preparing retriever: {str(e)}")
-            await websocket.close()
+        if not request_model.messages or len(request_model.messages) == 0:
+            yield "Error: No messages provided"
             return
-
-        # Validate request
-        if not request.messages or len(request.messages) == 0:
-            await websocket.send_text("Error: No messages provided")
-            await websocket.close()
-            return
-
-        last_message = request.messages[-1]
+        last_message = request_model.messages[-1]
         if last_message.role != "user":
-            await websocket.send_text("Error: Last message must be from the user")
-            await websocket.close()
+            yield "Error: Last message must be from the user"
             return
-
-        # Process previous messages to build conversation history
-        for i in range(0, len(request.messages) - 1, 2):
-            if i + 1 < len(request.messages):
-                user_msg = request.messages[i]
-                assistant_msg = request.messages[i + 1]
-                if user_msg.role == "user" and assistant_msg.role == "assistant":
-                    request_rag.memory.add_dialog_turn(
-                        user_query=user_msg.content,
-                        assistant_response=assistant_msg.content
-                    )
+        query = last_message.content
 
         is_deep_research = False
         research_iteration = 1
-        for msg in request.messages:
+        for msg in request_model.messages:
             if hasattr(msg, 'content') and msg.content and "[DEEP RESEARCH]" in msg.content:
                 is_deep_research = True
-                if msg == request.messages[-1]:
-                    msg.content = msg.content.replace("[DEEP RESEARCH]", "").strip()
+                if msg == request_model.messages[-1]:
+                    query = query.replace("[DEEP RESEARCH]", "").strip()
         if is_deep_research:
-            research_iteration = sum(1 for msg in request.messages if msg.role == 'assistant') + 1
+            research_iteration = sum(1 for msg in request_model.messages if msg.role == 'assistant') + 1
             logger.info(f"Deep Research request detected - iteration {research_iteration}")
-            if "continue" in last_message.content.lower() and "research" in last_message.content.lower():
+            if "continue" in query.lower() and "research" in query.lower():
                 original_topic = None
-                for msg_hist in request.messages:
+                for msg_hist in request_model.messages:
                     if msg_hist.role == "user" and "continue" not in msg_hist.content.lower():
                         original_topic = msg_hist.content.replace("[DEEP RESEARCH]", "").strip()
-                        logger.info(f"Found original research topic: {original_topic}")
+                        logger.info(f"Found original research topic for continuation: {original_topic}")
                         break
-                if original_topic:
-                    last_message.content = original_topic
-                    logger.info(f"Using original topic for research: {original_topic}")
-
-        query = last_message.content
-        context_text = ""
-        if not input_too_large:
-            try:
-                rag_query = query
-                if request.filePath:
-                    rag_query = f"Contexts related to {request.filePath}"
-                    logger.info(f"Modified RAG query to focus on file: {request.filePath}")
-                
-                retrieved_documents = request_rag(rag_query, language=request.language)
-                if retrieved_documents and retrieved_documents[0].documents:
-                    documents = retrieved_documents[0].documents
-                    logger.info(f"Retrieved {len(documents)} documents via RAG.")
-                    docs_by_file = {}
-                    for doc in documents:
-                        file_path_meta = doc.meta_data.get('file_path', 'unknown')
-                        if file_path_meta not in docs_by_file:
-                            docs_by_file[file_path_meta] = []
-                        docs_by_file[file_path_meta].append(doc)
-                    context_parts = [f"## File Path: {fp}\\n\\n" + "\\n\\n".join([d.text for d in docs_in_file]) for fp, docs_in_file in docs_by_file.items()]
-                    context_text = "\\n\\n" + "----------\\n\\n".join(context_parts)
-                    # Simple truncation for RAG context if it's extremely large, to avoid dominating the prompt entirely
-                    # This is a basic safeguard for RAG context only.
-                    # The primary concern for overall prompt size is the main user instruction.
-                    # A very large RAG context can still be an issue if the initial user prompt is also huge.
-                    # Let's set a simpler, higher threshold for RAG context alone.
-                    # Max 15k tokens for RAG, this may still be too large combined with huge user input.
-                    rag_context_tokens = count_tokens(context_text, request.provider == "ollama")
-                    if rag_context_tokens > 15000:
-                        logger.warning(f"RAG context is very large ({rag_context_tokens} tokens). Truncating RAG context to ~15000 tokens.")
-                        # Simple character-based truncation for this basic safeguard
-                        estimated_chars = 15000 * 4 
-                        context_text = context_text[:estimated_chars] + "... (RAG context truncated)"
-                        logger.info(f"Truncated RAG context token count: {count_tokens(context_text, request.provider == 'ollama')}")
-                else:
-                    logger.warning("No documents retrieved from RAG")
-            except Exception as e:
-                logger.error(f"Error in RAG retrieval: {str(e)}")
+                if original_topic: query = original_topic; logger.info(f"Using original topic for continued research: {query}")
         
-        repo_url = request.repo_url
-        repo_name = repo_url.split("/")[-1] if "/" in repo_url else repo_url
-        repo_type = request.type
-        language_code = request.language or "en"
-        language_name = {"en": "English", "ja": "Japanese (日本語)", "zh": "Mandarin Chinese (中文)", "es": "Spanish (Español)", "kr": "Korean (한국어)", "vi": "Vietnamese (Tiếng Việt)"}.get(language_code, "English")
-
-        # Create system prompt
+        assembled_prompt_parts = []
+        current_total_tokens = 0
+        provider = request_model.provider
+        model_name = request_model.model
+        repo_info_str = f"the {request_model.type} repository: {request_model.repo_url} ({request_model.repo_url.split('/')[-1] if '/' in request_model.repo_url else request_model.repo_url})"
+        language_name = {"en": "English", "ja": "Japanese (日本語)", "zh": "Mandarin Chinese (中文)", "es": "Spanish (Español)", "kr": "Korean (한국어)", "vi": "Vietnamese (Tiếng Việt)"}.get(request_model.language or "en", "English")
+        
+        system_prompt = "" 
         if is_deep_research:
             is_first_iteration = research_iteration == 1
-            is_final_iteration = research_iteration >= 5
+            is_final_iteration = research_iteration >= 5 
             if is_first_iteration:
                 system_prompt = f"""<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are an expert code analyst examining {repo_info_str}.
 You are conducting a multi-turn Deep Research process to thoroughly investigate the specific topic in the user's query.
 Your goal is to provide detailed, focused information EXCLUSIVELY about this topic.
 IMPORTANT:You MUST respond in {language_name} language.
@@ -343,7 +278,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 </style>"""
             elif is_final_iteration:
                 system_prompt = f"""<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are an expert code analyst examining {repo_info_str}.
 You are in the final iteration of a Deep Research process focused EXCLUSIVELY on the latest user query.
 Your goal is to synthesize all previous findings and provide a comprehensive conclusion that directly addresses this specific topic and ONLY this topic.
 IMPORTANT:You MUST respond in {language_name} language.
@@ -375,7 +310,7 @@ IMPORTANT:You MUST respond in {language_name} language.
 </style>"""
             else:
                 system_prompt = f"""<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are an expert code analyst examining {repo_info_str}.
 You are currently in iteration {research_iteration} of a Deep Research process focused EXCLUSIVELY on the latest user query.
 Your goal is to build upon previous research iterations and go deeper into this specific topic without deviating from it.
 IMPORTANT:You MUST respond in {language_name} language.
@@ -406,252 +341,258 @@ IMPORTANT:You MUST respond in {language_name} language.
 </style>"""
         else:
             system_prompt = f"""<role>
-You are an expert code analyst examining the {repo_type} repository: {repo_url} ({repo_name}).
+You are an expert code analyst examining {repo_info_str}.
 You provide direct, concise, and accurate information about code repositories.
 You NEVER start responses with markdown headers or code fences.
 IMPORTANT:You MUST respond in {language_name} language.
 </role>
 
 <guidelines>
-- Answer the user's question directly without ANY preamble or filler phrases
+- Answer the user's question directly without ANY preamble or filler phrases.
 - DO NOT include any rationale, explanation, or extra comments.
-- DO NOT start with preambles like "Okay, here's a breakdown" or "Here's an explanation"
-- DO NOT start with markdown headers like "## Analysis of..." or any file path references
-- DO NOT start with ```markdown code fences
-- DO NOT end your response with ``` closing fences
-- DO NOT start by repeating or acknowledging the question
-- JUST START with the direct answer to the question
-
-<example_of_what_not_to_do>
-```markdown
-## Analysis of `adalflow/adalflow/datasets/gsm8k.py`
-
-This file contains...
-```
-</example_of_what_not_to_do>
-- Format your response with proper markdown including headings, lists, and code blocks WITHIN your answer
-- For code analysis, organize your response with clear sections
-- Think step by step and structure your answer logically
-- Start with the most relevant information that directly addresses the user's query
-- Be precise and technical when discussing code
-- Your response language should be in the same language as the user's query
+- DO NOT start with preambles like "Okay, here's a breakdown" or "Here's an explanation".
+- DO NOT start with markdown headers like "## Analysis of..." or any file path references.
+- DO NOT start with ```markdown code fences.
+- DO NOT end your response with ``` closing fences.
+- DO NOT start by repeating or acknowledging the question.
+- JUST START with the direct answer to the question.
+- Format your response with proper markdown including headings, lists, and code blocks WITHIN your answer.
+- For code analysis, organize your response with clear sections.
+- Think step by step and structure your answer logically.
+- Start with the most relevant information that directly addresses the user's query.
+- Be precise and technical when discussing code.
 </guidelines>
 
 <style>
-- Use concise, direct language
-- Prioritize accuracy over verbosity
-- When showing code, include line numbers and file paths when relevant
-- Use markdown formatting to improve readability
+- Use concise, direct language.
+- Prioritize accuracy over verbosity.
+- When showing code, include line numbers and file paths when relevant.
+- Use markdown formatting to improve readability.
 </style>"""
 
-        file_content = ""
-        if request.filePath:
+        system_prompt_tokens = get_token_count_for_provider(system_prompt, provider, model_name)
+        if system_prompt_tokens > min(BUDGET_SYSTEM_PROMPT_TARGET, MAX_EFFECTIVE_PROMPT_TOKENS):
+            logger.error(f"System prompt ({system_prompt_tokens} tokens) is too large.")
+            yield "Error: System prompt configuration is too large."
+            return
+        assembled_prompt_parts.append(system_prompt)
+        current_total_tokens += system_prompt_tokens
+
+        query_original_tokens = get_token_count_for_provider(query, provider, model_name)
+        remaining_budget_for_query = MAX_EFFECTIVE_PROMPT_TOKENS - current_total_tokens
+        query_budget_to_use = min(BUDGET_QUERY_TARGET, remaining_budget_for_query)
+        truncated_query_text, query_was_truncated, query_final_tokens = truncate_text_by_tokens(query, query_budget_to_use, provider, model_name)
+        if query_was_truncated and query_final_tokens < MIN_TOKENS_FOR_QUERY:
+            logger.error(f"User query severely truncated (to {query_final_tokens} from {query_original_tokens}).")
+            yield "Error: Query too long. Please shorten."
+            return
+        current_total_tokens += query_final_tokens
+        if query_was_truncated:
+            logger.info(f"User query was truncated from {query_original_tokens} to {query_final_tokens} tokens.")
+
+        conversation_history_str = ""
+        if request_model.messages and len(request_model.messages) > 1:
+            temp_history_turns = []
+            for i in range(0, len(request_model.messages) - 1, 2):
+                if i + 1 < len(request_model.messages):
+                    user_msg, assistant_msg = request_model.messages[i], request_model.messages[i+1]
+                    if user_msg.role == "user" and assistant_msg.role == "assistant":
+                        temp_history_turns.append(f"<turn>\n<user>{user_msg.content}</user>\n<assistant>{assistant_msg.content}</assistant>\n</turn>")
+            temp_conv_history_tokens = 0
+            final_history_parts = []
+            remaining_budget_for_history = MAX_EFFECTIVE_PROMPT_TOKENS - current_total_tokens
+            history_budget_to_use = min(BUDGET_HISTORY_TARGET, remaining_budget_for_history)
+            for turn_str in reversed(temp_history_turns):
+                turn_tokens = get_token_count_for_provider(turn_str, provider, model_name)
+                if temp_conv_history_tokens + turn_tokens <= history_budget_to_use:
+                    final_history_parts.insert(0, turn_str)
+                    temp_conv_history_tokens += turn_tokens
+                else:
+                    logger.info("Truncating conversation history for prompt."); break
+            if final_history_parts:
+                conversation_history_str = "\n".join(final_history_parts)
+                assembled_prompt_parts.append(f"\n\n<conversation_history>\n{conversation_history_str}</conversation_history>")
+                current_total_tokens += temp_conv_history_tokens
+                logger.info(f"Added history ({temp_conv_history_tokens} tokens).")
+
+        file_content_str = ""
+        file_tokens_to_add = 0
+        if request_model.filePath:
             try:
-                file_content = get_file_content(request.repo_url, request.filePath, request.type, request.token)
-                logger.info(f"Successfully retrieved content for file: {request.filePath}")
-            except Exception as e:
-                logger.error(f"Error retrieving file content: {str(e)}")
+                file_content_raw = get_file_content(request_model.repo_url, request_model.filePath, request_model.type, request_model.token)
+                raw_file_tokens = get_token_count_for_provider(file_content_raw, provider, model_name)
+                logger.info(f"Raw file content for {request_model.filePath}: {raw_file_tokens} tokens.")
 
-        conversation_history = ""
-        for turn_id, turn in request_rag.memory().items():
-            if not isinstance(turn_id, int) and hasattr(turn, 'user_query') and hasattr(turn, 'assistant_response'):
-                conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
+                remaining_budget_for_file = MAX_EFFECTIVE_PROMPT_TOKENS - current_total_tokens
+                target_file_budget = min(BUDGET_FILE_CONTENT_TARGET, remaining_budget_for_file)
+
+                if raw_file_tokens > target_file_budget + 200: # Summarization threshold
+                    logger.info(f"File {request_model.filePath} ({raw_file_tokens} tokens) too large. Summarizing.")
+                    summarized_content, summarized_tokens = await summarize_content_with_llm(
+                        file_content_raw, truncated_query_text, request_model.filePath,
+                        min(BUDGET_SUMMARIZED_FILE_CONTENT_TARGET, remaining_budget_for_file), 
+                        provider, model_name, language_name
+                    )
+                    if summarized_content and summarized_tokens > 0:
+                        file_content_str, file_tokens_to_add = summarized_content, summarized_tokens
+                    else: # Summarization failed or empty, fallback to truncation
+                        file_content_str, _, file_tokens_to_add = truncate_text_by_tokens(file_content_raw, target_file_budget, provider, model_name)
+                else: # Small enough for direct inclusion (or truncation)
+                    file_content_str, _, file_tokens_to_add = truncate_text_by_tokens(file_content_raw, target_file_budget, provider, model_name)
+                
+                if file_tokens_to_add > 0:
+                    assembled_prompt_parts.append(f"\n\n<currentFileContent path=\"{request_model.filePath}\">\n{file_content_str}\n</currentFileContent>")
+                    current_total_tokens += file_tokens_to_add
+                logger.info(f"Added file content for {request_model.filePath} ({file_tokens_to_add} tokens).")
+            except Exception as e_file: logger.error(f"Error with file content for {request_model.filePath}: {e_file}", exc_info=True)
+
+        context_text_str = ""
+        last_message_initial_tokens = get_token_count_for_provider(request_model.messages[-1].content, provider, model_name)
+        if last_message_initial_tokens <= 20000:
+            try:
+                rag_query_for_retrieval = truncated_query_text 
+                if request_model.filePath: rag_query_for_retrieval = f"Context for {request_model.filePath}. Query: {truncated_query_text}"
+                retrieved_data = request_rag(rag_query_for_retrieval, language=request_model.language)
+                if retrieved_data and retrieved_data[0].documents:
+                    docs = retrieved_data[0].documents; logger.info(f"RAG: {len(docs)} docs.")
+                    temp_parts, temp_tokens = [], 0
+                    remaining_rag_budget = MAX_EFFECTIVE_PROMPT_TOKENS - current_total_tokens
+                    rag_budget = min(BUDGET_RAG_CONTEXT_TARGET, remaining_rag_budget)
+                    for doc in docs:
+                        doc_fmt = f"--- Source: {doc.meta_data.get('file_path', 'unknown')} ---\n{doc.text}\n--- End Source ---"
+                        doc_t = get_token_count_for_provider(doc_fmt, provider, model_name)
+                        if temp_tokens + doc_t <= rag_budget:
+                            temp_parts.append(doc_fmt); temp_tokens += doc_t
+                        else:
+                            if rag_budget - temp_tokens > MIN_TOKENS_FOR_CONTEXT:
+                                trunc_doc, _, trunc_t = truncate_text_by_tokens(doc_fmt, rag_budget - temp_tokens, provider, model_name)
+                                if trunc_t > 0: temp_parts.append(trunc_doc); temp_tokens += trunc_t
+                            logger.info(f"RAG budget hit. Added {len(temp_parts)} docs/parts."); break
+                    if temp_parts: 
+                        context_text_str = "\n\n".join(temp_parts)
+                        assembled_prompt_parts.append(f"\n\n<START_OF_CONTEXT>\n{context_text_str}\n<END_OF_CONTEXT>")
+                        current_total_tokens += temp_tokens; logger.info(f"Added RAG context ({temp_tokens} tokens).")
+                    else: assembled_prompt_parts.append("\n\n<note>No RAG context fit budget.</note>")
+                else: assembled_prompt_parts.append("\n\n<note>No RAG docs retrieved.</note>")
+            except Exception as e_rag: logger.error(f"RAG error: {e_rag}", exc_info=True); assembled_prompt_parts.append(f"\n\n<note>RAG error: {e_rag}</note>")
+        else: assembled_prompt_parts.append("\n\n<note>RAG skipped: large query.</note>")
         
-        # Determine the base of the prompt: if the query looks like a large instructional prompt, use it as the base.
-        # Otherwise, use the system_prompt.
-        # This is a simpler heuristic than the full token-based switching previously.
-        # A "master instructional query" is likely long and contains specific phrasing.
-        prompt_base = ""
-        if last_message_content_tokens > 3000 and ("expert technical writer" in query.lower() or "[WIKI_PAGE_TOPIC]" in query.lower()):
-            logger.info("Using user query as the primary prompt base due to its size and content.")
-            prompt_base = query # The user's detailed instructions
+        assembled_prompt_parts.append(f"\n\n<query>\n{truncated_query_text}\n</query>\n\nAssistant:")
+        final_prompt = "".join(assembled_prompt_parts)
+        final_calculated_tokens = get_token_count_for_provider(final_prompt, provider, model_name)
+        logger.info(f"Final prompt: Budgeted tokens {current_total_tokens}, Recalculated {final_calculated_tokens} (Target: {MAX_EFFECTIVE_PROMPT_TOKENS})")
+        if final_calculated_tokens > MODEL_MAX_CONTEXT_WINDOW_TOKENS: # Hard limit check
+            logger.error(f"FATAL: Final prompt ({final_calculated_tokens}) exceeds model max window ({MODEL_MAX_CONTEXT_WINDOW_TOKENS}).")
+            yield "Error: Assembled request is too large for the AI model. Please simplify significantly."
+            return
+        elif final_calculated_tokens > MAX_EFFECTIVE_PROMPT_TOKENS * 1.05:
+             logger.warning(f"Final prompt ({final_calculated_tokens}) exceeds effective target by >5%.")
+
+        model_config_details = get_llm_config(request_model.provider, request_model.model)
+        llm_model_kwargs = model_config_details["model_kwargs"]
+        api_kwargs: Dict[str, Any] = {}
+        llm_client: Any = None
+        
+        if provider == "ollama":
+            llm_client = OllamaClient()
+            api_kwargs = llm_client.convert_inputs_to_api_kwargs(input=final_prompt, model_kwargs={"model": llm_model_kwargs["model"], "stream": True, "options": llm_model_kwargs.get("options", {})}, model_type=ModelType.LLM)
+        elif provider == "openrouter":
+            llm_client = OpenRouterClient()
+            api_kwargs = llm_client.convert_inputs_to_api_kwargs(input=final_prompt, model_kwargs={"model": request_model.model, "stream": True, **llm_model_kwargs}, model_type=ModelType.LLM)
+        elif provider == "openai":
+            llm_client = OpenAIClient()
+            api_kwargs = llm_client.convert_inputs_to_api_kwargs(input=final_prompt, model_kwargs={"model": request_model.model, "stream": True, **llm_model_kwargs, "max_tokens": DESIRED_MAX_OUTPUT_TOKENS}, model_type=ModelType.LLM)
+        elif provider == "google":
+            if not google_api_key: yield "Error: Google API key not configured."; return
+            llm_client = genai.GenerativeModel(model_name=llm_model_kwargs["model"], generation_config={**llm_model_kwargs, "max_output_tokens": DESIRED_MAX_OUTPUT_TOKENS})
         else:
-            prompt_base = system_prompt # Backend-defined system prompt
+            yield f"Error: Unsupported provider '{provider}'"; return
 
-        # Assemble the prompt
-        prompt_parts = [prompt_base]
+        logger.info(f"Making LLM call for {provider} ({request_model.model}) with prompt tokens: {final_calculated_tokens}")
+        await enforce_llm_rate_limit(provider)
+        stream_had_content = False
+        full_response_text = ""
 
-        if conversation_history:
-            prompt_parts.append(f"<conversation_history>\\n{conversation_history}</conversation_history>")
-
-        if file_content:
-            prompt_parts.append(f"<currentFileContent path=\\\"{request.filePath}\\\">\\n{file_content}\\n</currentFileContent>")
-        
-        if context_text.strip():
-            prompt_parts.append(f"<START_OF_CONTEXT>\\n{context_text}\\n<END_OF_CONTEXT>")
-        elif not input_too_large: # RAG was attempted but yielded no results
-             prompt_parts.append("<note>No relevant context found via retrieval. Answering based on general knowledge and provided query.</note>")
-        elif input_too_large: # RAG was skipped
-            prompt_parts.append("<note>Retrieval augmentation was skipped due to the large size of the input query.</note>")
-
-        if not is_deep_research: # if not a Deep Research query, add the user's query explicitly if it wasn't the base
-             prompt_parts.append(f"<query>\\n{query}\\n</query>")
-        
-        prompt = "\\n\\n".join(prompt_parts)
-        prompt += "\\n\\nAssistant:"
-        
-        # Log final prompt for debugging (optional, can be very verbose)
-        # logger.debug(f"Final assembled prompt:\\n{prompt}")
-        final_prompt_token_count = count_tokens(prompt, request.provider == "ollama")
-        logger.info(f"Final assembled prompt token count: {final_prompt_token_count}")
-        if final_prompt_token_count > 30000: # A general warning if prompt is very large, e.g. > 30k
-            logger.warning(f"WARNING: Final prompt token count ({final_prompt_token_count}) is very large and may exceed model limits or cause performance issues.")
-
-        model_config = get_model_config(request.provider, request.model)["model_kwargs"]
-
-        if request.provider == "ollama":
-            # prompt += " /no_think" # Ollama specific - handled by client if needed
-            model = OllamaClient()
-            model_kwargs = {
-                "model": model_config["model"],
-                "stream": True,
-                "options": {
-                    "temperature": model_config["temperature"],
-                    "top_p": model_config["top_p"],
-                    "num_ctx": model_config["num_ctx"]
-                }
-            }
-            api_kwargs = model.convert_inputs_to_api_kwargs(input=prompt, model_kwargs=model_kwargs, model_type=ModelType.LLM)
-        
-        elif request.provider == "openrouter":
-            logger.info(f"Using OpenRouter with model: {request.model}")
-            if not os.environ.get("OPENROUTER_API_KEY"):
-                logger.warning("OPENROUTER_API_KEY environment variable is not set, but continuing with request")
-            model = OpenRouterClient()
-            model_kwargs = {"model": request.model, "stream": True, "temperature": model_config["temperature"], "top_p": model_config["top_p"]}
-            api_kwargs = model.convert_inputs_to_api_kwargs(input=prompt, model_kwargs=model_kwargs, model_type=ModelType.LLM)
-
-        elif request.provider == "openai":
-            logger.info(f"Using Openai protocol with model: {request.model}")
-            if not os.environ.get("OPENAI_API_KEY"):
-                logger.warning("OPENAI_API_KEY environment variable is not set, but continuing with request")
-            model = OpenAIClient()
-            model_kwargs = {"model": request.model, "stream": True, "temperature": model_config["temperature"], "top_p": model_config["top_p"]}
-            api_kwargs = model.convert_inputs_to_api_kwargs(input=prompt, model_kwargs=model_kwargs, model_type=ModelType.LLM)
-        
-        else: # Default to Google
-            model = genai.GenerativeModel(
-                model_name=model_config["model"],
-                generation_config={
-                    "temperature": model_config["temperature"],
-                    "top_p": model_config["top_p"],
-                    "top_k": model_config["top_k"]
-                }
-            )
-            # For Google, api_kwargs is not used in the same way; prompt is passed directly to generate_content
-
-        # Process the response based on the provider
         try:
-            await enforce_llm_rate_limit() # Enforce rate limit before LLM call
-            logger.info(f"Making LLM call for {request.provider} after rate limit check...")
+            if provider == "google":
+                response_stream = await llm_client.generate_content_async(final_prompt, stream=True)
+                async for chunk in response_stream:
+                    stream_had_content = True; chunk_text = ""
+                    try:
+                        candidate: Optional[Candidate] = chunk.candidates[0] if chunk.candidates else None
+                        if candidate and candidate.finish_reason != Candidate.FinishReason.UNSPECIFIED:
+                            if candidate.finish_reason == Candidate.FinishReason.MAX_TOKENS: yield "\n[Warning: Response truncated by AI (MAX_TOKENS).]"; break
+                            elif candidate.finish_reason != Candidate.FinishReason.STOP: yield f"\n[Error: AI stopped - {candidate.finish_reason.name}]"; break
+                        if chunk.parts: chunk_text = ''.join(getattr(p, 'text', '') for p in chunk.parts)
+                        elif hasattr(chunk, 'text'): chunk_text = chunk.text
+                        if chunk_text: yield chunk_text; full_response_text += chunk_text
+                    except BlockedPromptException as bpe: yield f"\n[Error: Google blocked prompt: {bpe}]"; break
+                    except ValueError as ve: yield "\n[Error: Google API malformed chunk.]"; logger.error(f'Google chunk error: {ve}', exc_info=True); break
+                    except Exception as e_gc: yield "\n[Error: Google stream processing error.]"; logger.error(f'Google stream error: {e_gc}', exc_info=True); break
+                if not stream_had_content and hasattr(response_stream, 'prompt_feedback') and response_stream.prompt_feedback and response_stream.prompt_feedback.block_reason:
+                    yield f"\n[Error: Google API blocked prompt before streaming. Reason: {response_stream.prompt_feedback.block_reason.name}]"
 
-            if request.provider == "ollama":
-                response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
-                async for chunk in response:
-                    text = getattr(chunk, 'response', None) or getattr(chunk, 'text', None) or str(chunk)
-                    if text and not text.startswith('model=') and not text.startswith('created_at='):
-                        text = text.replace('<think>', '').replace('</think>', '')
-                        await websocket.send_text(text)
-                await websocket.close()
-            elif request.provider == "openrouter":
-                response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
-                async for chunk in response:
-                    await websocket.send_text(chunk)
-                await websocket.close()
-            elif request.provider == "openai":
-                response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
-                async for chunk in response:
-                    choices = getattr(chunk, "choices", [])
-                    if len(choices) > 0:
-                        delta = getattr(choices[0], "delta", None)
-                        if delta is not None:
-                            text = getattr(delta, "content", None)
-                            if text is not None:
-                                await websocket.send_text(text)
-                await websocket.close()
-            else: # Google
-                response = model.generate_content(prompt, stream=True)
-                for chunk in response:
-                    if hasattr(chunk, 'text'):
-                        await websocket.send_text(chunk.text)
-                await websocket.close()
-
-        except Exception as e_outer:
-            logger.error(f"Error in streaming response or LLM call: {str(e_outer)}", exc_info=True)
-            error_message = str(e_outer)
+            elif provider in ["ollama", "openrouter", "openai"]:
+                response_stream = await llm_client.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
+                async for chunk_data in response_stream:
+                    stream_had_content = True; text_to_send = ""
+                    if provider == "ollama": text_to_send = chunk_data.get('response', '') if isinstance(chunk_data, dict) else str(chunk_data)
+                    elif provider == "openrouter": text_to_send = str(chunk_data) 
+                    elif provider == "openai":
+                        choices = getattr(chunk_data, "choices", [])
+                        if choices and hasattr(choices[0], "delta") and choices[0].delta: text_to_send = choices[0].delta.content or ""
+                    if text_to_send: yield text_to_send.replace('<think>', '').replace('</think>', ''); full_response_text += text_to_send
             
-            # Check if it's a Google API specific error that might indicate content policy violation / safety
-            is_google_api_error = False
-            google_response_text = None
-            if hasattr(e_outer, 'response') and hasattr(e_outer.response, 'prompt_feedback'):
-                 # This structure is typical for google.generativeai.types. génération.GenerateContentResponse errors
-                if e_outer.response.prompt_feedback.block_reason:
-                    is_google_api_error = True
-                    google_response_text = f"Content generation blocked. Reason: {e_outer.response.prompt_feedback.block_reason}."
-                    if e_outer.response.candidates and e_outer.response.candidates[0].finish_reason.name == 'SAFETY':
-                         google_response_text += f" Finish Reason: SAFETY. Safety Ratings: {e_outer.response.prompt_feedback.safety_ratings}"
+            if not stream_had_content: yield "\n[Note: AI model returned an empty response.]"
+        
+        except BlockedPromptException as e_bpe: yield f"\n[Error: Request blocked by content safety filter ({provider}). Details: {e_bpe}]"; logger.error(f'{provider} blocked: {e_bpe}', exc_info=True)
+        except generation_types.StopCandidateException as e_sce: yield f"\n[Error: AI stopped unexpectedly ({provider}). Reason: {e_sce.finish_reason.name if e_sce.finish_reason else 'Unknown'}]"; logger.error(f'{provider} stopped: {e_sce}', exc_info=True)
+        except Exception as e_llm: 
+            err_msg = f"Error with {provider} AI model."
+            if "context length" in str(e_llm).lower() or "token limit" in str(e_llm).lower(): err_msg += " Exceeded token limit."
+            yield err_msg; logger.error(f'{provider} LLM error: {e_llm}', exc_info=True)
+        finally:
+            if full_response_text and len(full_response_text) < 500: logger.info(f"LLM {provider} full captured response (on completion/error): {full_response_text[:500]}")
+            elif full_response_text: logger.info(f"LLM {provider} full captured response (on completion/error) was long, showing start: {full_response_text[:200]}...")
 
-            if google_response_text:
-                 await websocket.send_text(f"\\nError: {google_response_text}")
-            elif "maximum context length" in error_message.lower() or "token limit" in error_message.lower() or "too many tokens" in error_message.lower() or "prompt is too long" in error_message.lower() or "user input is too long" in error_message.lower() :
-                logger.warning("Token limit exceeded, attempting fallback without RAG/file context.")
-                try:
-                    # Simplified prompt: System prompt + original query ONLY.
-                    simplified_prompt_base = ""
-                    if is_deep_research and last_message_content_tokens < 30000 : # If Deep Research query was just a bit too big with context
-                        simplified_prompt_base = query # Try with just the Deep Research query
-                        logger.info("Fallback: Using Deep Research query as base due to its large size.")
-                    else: # For regular queries or extremely large Deep Research queries, fall back to system_prompt + query
-                        simplified_prompt_base = f"{system_prompt}\\n\\n<query>\\n{query}\\n</query>"
+    except Exception as e_process_logic:
+        logger.error(f"Unhandled error in _process_chat_request_logic: {str(e_process_logic)}", exc_info=True)
+        yield f"Error: Server-side processing failed: {str(e_process_logic)}"
 
-                    simplified_prompt = f"{simplified_prompt_base}\\n\\n<note>Answering with reduced context due to original request size.</note>\\n\\nAssistant:"
-                    
-                    logger.info(f"Fallback simplified prompt token count: {count_tokens(simplified_prompt, request.provider == 'ollama')}")
 
-                    await enforce_llm_rate_limit() # Enforce rate limit for fallback call too
-                    logger.info(f"Making FALLBACK LLM call for {request.provider} after rate limit check...")
-
-                    if request.provider == "ollama":
-                        fallback_api_kwargs = model.convert_inputs_to_api_kwargs(input=simplified_prompt, model_kwargs=model_kwargs, model_type=ModelType.LLM)
-                        fallback_response = await model.acall(api_kwargs=fallback_api_kwargs, model_type=ModelType.LLM)
-                        async for chunk in fallback_response:
-                            text = getattr(chunk, 'response', None) or getattr(chunk, 'text', None) or str(chunk)
-                            if text and not text.startswith('model=') and not text.startswith('created_at='):
-                                text = text.replace('<think>', '').replace('</think>', '')
-                                await websocket.send_text(text)
-                    elif request.provider == "openrouter":
-                        fallback_api_kwargs = model.convert_inputs_to_api_kwargs(input=simplified_prompt, model_kwargs=model_kwargs, model_type=ModelType.LLM)
-                        fallback_response = await model.acall(api_kwargs=fallback_api_kwargs, model_type=ModelType.LLM)
-                        async for chunk in fallback_response: await websocket.send_text(chunk)
-                    elif request.provider == "openai":
-                        fallback_api_kwargs = model.convert_inputs_to_api_kwargs(input=simplified_prompt, model_kwargs=model_kwargs, model_type=ModelType.LLM)
-                        fallback_response = await model.acall(api_kwargs=fallback_api_kwargs, model_type=ModelType.LLM)
-                        async for chunk in fallback_response:
-                            choices = getattr(chunk, "choices", [])
-                            if len(choices) > 0:
-                                delta = getattr(choices[0], "delta", None)
-                                if delta is not None:
-                                    text = getattr(delta, "content", None)
-                                    if text is not None: await websocket.send_text(text)
-                    else: # Google
-                        fallback_model = genai.GenerativeModel( model_name=model_config["model"], generation_config=model.generation_config ) # Re-use config
-                        fallback_response = fallback_model.generate_content(simplified_prompt, stream=True)
-                        for chunk in fallback_response:
-                            if hasattr(chunk, 'text'): await websocket.send_text(chunk.text)
-                except Exception as e2:
-                    logger.error(f"Error in fallback streaming response: {str(e2)}", exc_info=True)
-                    await websocket.send_text(f"\\nI apologize, but your request is too large for me to process, even after simplification. Please try a shorter query or break it into smaller parts.")
+async def handle_websocket_chat(websocket: WebSocket):
+    """
+    Handle WebSocket connection for chat completions.
+    Uses the refactored _process_chat_request_logic for core operations.
+    """
+    await websocket.accept()
+    request_model_ws: Optional[ChatCompletionRequest] = None
+    try:
+        request_data = await websocket.receive_json()
+        request_model_ws = ChatCompletionRequest(**request_data)
+        
+        async for content_chunk in _process_chat_request_logic(request_model_ws):
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(content_chunk)
             else:
-                await websocket.send_text(f"\\nError: {error_message}")
-            
-            await websocket.close() # Ensure close on error
+                logger.warning("WebSocket disconnected during streaming, stopping send.")
+                break # Stop trying to send if client disconnected
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
-    except Exception as e:
-        logger.error(f"Error in WebSocket handler: {str(e)}", exc_info=True)
-        try:
-            await websocket.send_text(f"Error: {str(e)}")
+        logger.info("WebSocket disconnected by client.")
+    except HTTPException as http_exc:
+        logger.error(f"HTTPException in WebSocket handler shell: {http_exc.detail}", exc_info=True)
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try: await websocket.send_text(f"Error: {http_exc.detail}"); await websocket.close() 
+            except: pass
+    except Exception as e_ws_shell:
+        logger.error(f"Unexpected error in WebSocket shell: {str(e_ws_shell)}", exc_info=True)
+        if request_model_ws:
+             logger.error(f"Failing request context (WS shell): Provider={request_model_ws.provider}, Model={request_model_ws.model}, Repo={request_model_ws.repo_url}")
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try: await websocket.send_text(f"An unexpected server error occurred. Please check server logs."); await websocket.close()
+            except: pass
+    finally:
+        if websocket.client_state != WebSocketState.DISCONNECTED:
             await websocket.close()
-        except: # If sending error itself fails
-            pass
+            logger.info("WebSocket connection explicitly closed by server at end of handler.")

@@ -733,7 +733,7 @@ This file contains...
                 except Exception as e_inner_google_stream:
                     logger.error(f"Error during Google stream processing: {str(e_inner_google_stream)}", exc_info=True)
                     # Check if the error message itself indicates a MAX_TOKENS or similar issue not caught by finish_reason
-                    if "finish_reason: MAX_TOKENS" in str(e_inner_google_stream).upper() or \\
+                    if "finish_reason: MAX_TOKENS" in str(e_inner_google_stream).upper()
                        "The `response.text` quick accessor requires the response to contain a valid `Part`" in str(e_inner_google_stream):
                          logger.warning("Google Gemini: MAX_TOKENS reached (inferred from exception).")
                          await websocket.send_text("\\n[INFO] Content generation stopped due to maximum token limit (inferred).")

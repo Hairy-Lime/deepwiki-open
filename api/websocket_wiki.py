@@ -13,6 +13,9 @@ from adalflow.core.types import ModelType
 from fastapi import WebSocket, WebSocketDisconnect, HTTPException, WebSocketState
 from pydantic import BaseModel, Field
 
+import fastapi # Debug import
+print(f"[DEBUG] FastAPI version in websocket_wiki.py: {fastapi.__version__}") # Debug print
+
 from api.config import get_model_config as get_llm_config # Alias to avoid confusion
 from api.data_pipeline import count_tokens, get_file_content
 from api.openai_client import OpenAIClient

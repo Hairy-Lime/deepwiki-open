@@ -27,9 +27,24 @@ logger = logging.getLogger(__name__)
 
 # --- Rate Limiter Configuration ---
 LLM_REQUEST_TIMESTAMPS = deque()
-LLM_RPM_LIMIT = 100  # Requests Per Minute
+# LLM_RPM_LIMIT = 100  # Requests Per Minute # Default, can be overridden by env
+try:
+    LLM_RPM_LIMIT = int(os.environ.get("LLM_RPM_LIMIT", 100))
+except ValueError:
+    LLM_RPM_LIMIT = 100
+    logger.warning(f"Invalid LLM_RPM_LIMIT in environment, defaulting to {LLM_RPM_LIMIT}")
+
 LLM_RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_LOCK = asyncio.Lock()
+
+# --- Concurrency Limiter for WebSocket Handler ---
+try:
+    MAX_CONCURRENT_WIKI_JOBS = int(os.environ.get("MAX_CONCURRENT_WIKI_JOBS", 3))
+except ValueError:
+    MAX_CONCURRENT_WIKI_JOBS = 3
+    logger.warning(f"Invalid MAX_CONCURRENT_WIKI_JOBS in environment, defaulting to {MAX_CONCURRENT_WIKI_JOBS}")
+WEBSOCKET_JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_WIKI_JOBS)
+logger.info(f"WebSocket job concurrency limit set to: {MAX_CONCURRENT_WIKI_JOBS}")
 
 async def enforce_llm_rate_limit():
     async with RATE_LIMIT_LOCK:
@@ -206,8 +221,15 @@ async def handle_websocket_chat(websocket: WebSocket):
     This replaces the HTTP streaming endpoint with a WebSocket connection.
     """
     await websocket.accept()
+    job_acquired = False # Flag to track if semaphore was acquired
 
     try:
+        # Try to acquire the semaphore
+        logger.debug("Attempting to acquire WebSocket job semaphore...")
+        await WEBSOCKET_JOB_SEMAPHORE.acquire()
+        job_acquired = True
+        logger.debug("WebSocket job semaphore acquired.")
+
         # Receive and parse the request data
         request_data = await websocket.receive_json()
         request = ChatCompletionRequest(**request_data)
@@ -748,16 +770,22 @@ This file contains...
             
             # Check if it's a Google API specific error that might indicate content policy violation / safety
             is_google_api_error = False
-            google_response_text = None
-            if hasattr(e_outer, 'response') and hasattr(e_outer.response, 'prompt_feedback'):
-                 # This structure is typical for google.generativeai.types. génération.GenerateContentResponse errors
-                if e_outer.response.prompt_feedback.block_reason:
-                    is_google_api_error = True
-                    google_response_text = f"Content generation blocked. Reason: {e_outer.response.prompt_feedback.block_reason}."
-                    if e_outer.response.candidates and e_outer.response.candidates[0].finish_reason.name == 'SAFETY':
-                         google_response_text += f" Finish Reason: SAFETY. Safety Ratings: {e_outer.response.prompt_feedback.safety_ratings}"
-
-            if google_response_text:
+            google_response_text = None # Initialize to None
+            # Safely check attributes
+            if hasattr(e_outer, 'response') and e_outer.response and \
+               hasattr(e_outer.response, 'prompt_feedback') and e_outer.response.prompt_feedback and \
+               hasattr(e_outer.response.prompt_feedback, 'block_reason') and e_outer.response.prompt_feedback.block_reason:
+                is_google_api_error = True
+                google_response_text = f"Content generation blocked. Reason: {e_outer.response.prompt_feedback.block_reason}."
+                # Further check for safety details if candidate exists and has finish_reason and safety_ratings
+                if hasattr(e_outer.response, 'candidates') and e_outer.response.candidates and \
+                   hasattr(e_outer.response.candidates[0], 'finish_reason') and \
+                   hasattr(e_outer.response.candidates[0].finish_reason, 'name') and \
+                   e_outer.response.candidates[0].finish_reason.name == 'SAFETY' and \
+                   hasattr(e_outer.response.prompt_feedback, 'safety_ratings'):
+                    google_response_text += f" Finish Reason: SAFETY. Safety Ratings: {e_outer.response.prompt_feedback.safety_ratings}"
+            
+            if google_response_text: # Use the more specific message if available
                  await websocket.send_text(f"\\nError: {google_response_text}")
             elif "maximum context length" in error_message.lower() or "token limit" in error_message.lower() or "too many tokens" in error_message.lower() or "prompt is too long" in error_message.lower() or "user input is too long" in error_message.lower() :
                 logger.warning("Token limit exceeded, attempting fallback without RAG/file context.")
@@ -817,7 +845,18 @@ This file contains...
     except Exception as e:
         logger.error(f"Error in WebSocket handler: {str(e)}", exc_info=True)
         try:
-            await websocket.send_text(f"Error: {str(e)}")
-            await websocket.close()
-        except: # If sending error itself fails
-            pass
+            # Check if websocket is still open before sending
+            if websocket.client_state == websocket.client_state.CONNECTED:
+                await websocket.send_text(f"Error: {str(e)}")
+                await websocket.close()
+        except Exception as e_close: # If sending error itself fails
+            logger.error(f"Failed to send error to client or close WebSocket: {str(e_close)}")
+            pass # WebSocket might already be closed
+    finally:
+        if job_acquired:
+            WEBSOCKET_JOB_SEMAPHORE.release()
+            logger.debug("WebSocket job semaphore released.")
+        # Ensure websocket is closed if not already, unless it was a normal disconnect
+        if websocket.client_state == websocket.client_state.CONNECTED:
+             logger.info("Ensuring WebSocket is closed in main finally block.")
+             await websocket.close()

@@ -687,18 +687,61 @@ This file contains...
                 await websocket.close()
             else: # Google
                 response = model.generate_content(prompt, stream=True)
-                for chunk in response:
-                    # Check if the chunk has parts and iterate through them
-                    if chunk.parts:
-                        for part in chunk.parts:
-                            if hasattr(part, 'text') and part.text:
-                                await websocket.send_text(part.text)
-                    # Handle cases where generation might have stopped without valid parts (e.g. safety reasons)
-                    elif chunk.candidates and chunk.candidates[0].finish_reason.name != 'STOP' and chunk.candidates[0].finish_reason.name != 'UNSPECIFIED':
-                        logger.warning(f"Chunk processing stopped. Finish Reason: {chunk.candidates[0].finish_reason.name}")
-                        # Optionally send a message to client or break, depending on desired behavior
-                        # For now, we just log and continue, but might be better to break or send an error marker.
-                await websocket.close()
+                try:
+                    for chunk in response:
+                        if not chunk.candidates:
+                            logger.warning("Google Gemini: Received a chunk with no candidates. Skipping.")
+                            continue
+
+                        candidate = chunk.candidates[0]
+                        finish_reason_name = "UNSPECIFIED" # Default if finish_reason is None
+                        if hasattr(candidate, 'finish_reason') and candidate.finish_reason is not None:
+                             # Directly access the enum's name if it's an enum, or use it if it's already a string/int
+                            if hasattr(candidate.finish_reason, 'name'):
+                                finish_reason_name = candidate.finish_reason.name
+                            else: # It might be an int or string already
+                                finish_reason_name = str(candidate.finish_reason)
+
+
+                        if finish_reason_name == 'MAX_TOKENS' or finish_reason_name == '1': # 1 is MAX_TOKENS enum value
+                            logger.warning("Google Gemini: MAX_TOKENS reached.")
+                            await websocket.send_text("\\n[INFO] Content generation stopped due to maximum token limit.")
+                            break 
+                        elif finish_reason_name == 'SAFETY' or finish_reason_name == '2': # 2 is SAFETY enum value
+                            safety_ratings_str = "N/A"
+                            if hasattr(chunk, 'prompt_feedback') and chunk.prompt_feedback and hasattr(chunk.prompt_feedback, 'safety_ratings'):
+                                safety_ratings_str = str(chunk.prompt_feedback.safety_ratings)
+                            logger.warning(f"Google Gemini: Content generation stopped due to SAFETY. Ratings: {safety_ratings_str}")
+                            await websocket.send_text("\\n[ERROR] Content generation stopped due to safety filters.")
+                            break
+                        elif finish_reason_name not in ['STOP', '0', 'UNSPECIFIED', 'FINISH_REASON_UNSPECIFIED']: # 0 is STOP
+                            logger.warning(f"Google Gemini: Chunk processing stopped. Finish Reason: {finish_reason_name}")
+                            await websocket.send_text(f"\\n[WARNING] Content generation may be incomplete. Reason: {finish_reason_name}")
+                            break
+                        
+                        # If finish_reason allows content (STOP or UNSPECIFIED)
+                        # and the content/parts exist, process them.
+                        if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    await websocket.send_text(part.text)
+                        # If it's STOP reason but no parts, it's just the end.
+                        elif finish_reason_name == 'STOP' or finish_reason_name == '0':
+                            logger.info("Google Gemini: Stream finished with STOP reason.")
+                            break 
+                                
+                except Exception as e_inner_google_stream:
+                    logger.error(f"Error during Google stream processing: {str(e_inner_google_stream)}", exc_info=True)
+                    # Check if the error message itself indicates a MAX_TOKENS or similar issue not caught by finish_reason
+                    if "finish_reason: MAX_TOKENS" in str(e_inner_google_stream).upper() or \\
+                       "The `response.text` quick accessor requires the response to contain a valid `Part`" in str(e_inner_google_stream):
+                         logger.warning("Google Gemini: MAX_TOKENS reached (inferred from exception).")
+                         await websocket.send_text("\\n[INFO] Content generation stopped due to maximum token limit (inferred).")
+                    else:
+                        await websocket.send_text(f"\\n[ERROR] Error processing stream from Google: {str(e_inner_google_stream)}")
+                finally:
+                    logger.info("Closing WebSocket after Google stream.")
+                    await websocket.close()
 
         except Exception as e_outer:
             logger.error(f"Error in streaming response or LLM call: {str(e_outer)}", exc_info=True)

@@ -13,7 +13,7 @@ const getWebSocketUrl = () => {
   // Replace http:// with ws:// or https:// with wss://
   const wsBaseUrl = (process.env.NEXT_PUBLIC_SERVER_BASE_URL || baseUrl).replace(/^https/, 'wss').replace(/^http/, 'ws');
   console.log('[websocketClient] wsBaseUrl after replace:', wsBaseUrl);
-  const finalUrl = `${wsBaseUrl}/api/ws/chat`;
+  const finalUrl = `${wsBaseUrl}/ws/chat`;
   console.log('[websocketClient] Final WebSocket URL for connection:', finalUrl);
   return finalUrl;
 };

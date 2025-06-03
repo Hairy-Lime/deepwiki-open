@@ -266,7 +266,7 @@ Give me the numbered list with brief descriptions for each slide. Be creative bu
       try {
         // Create WebSocket URL from the server base URL
         const wsBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.replace(/^https/, 'wss').replace(/^http/, 'ws');
-        const wsUrl = `${wsBaseUrl}/api/ws/chat`;
+        const wsUrl = `${wsBaseUrl}/ws/chat`;
 
         // Create a new WebSocket connection
         const ws = new WebSocket(wsUrl);
@@ -541,7 +541,7 @@ Please return ONLY the HTML with no markdown formatting or code blocks. Just the
         try {
           // Create WebSocket URL from the server base URL
           const wsBaseUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.replace(/^https/, 'wss').replace(/^http/, 'ws');
-          const wsUrl = `${wsBaseUrl}/api/ws/chat`;
+          const wsUrl = `${wsBaseUrl}/ws/chat`;
 
           // Create a new WebSocket connection
           const ws = new WebSocket(wsUrl);
